@@ -63,6 +63,11 @@ function normalizeCandidates(candidates) {
     }));
 }
 
+function normalizeSingleCandidate(candidate) {
+  const normalized = normalizeCandidates(candidate ? [candidate] : []);
+  return normalized.length > 0 ? normalized[0] : null;
+}
+
 function buildPublishedCandidate(room) {
   if (!room.externalAddress || !room.externalPort) return [];
 
@@ -195,7 +200,14 @@ app.post("/rooms/:roomId/join", (req, res) => {
     hostCandidates: Array.isArray(room.hostCandidates) && room.hostCandidates.length > 0
       ? room.hostCandidates
       : buildPublishedCandidate(room),
-    hostReady: false
+    hostReady: false,
+    controllingRole: "host",
+    clientObservedHostCandidate: null,
+    selectedHostCandidate: null,
+    selectedClientCandidate: null,
+    nominated: false,
+    nominatedBy: null,
+    nominatedAtUnixMs: null
   };
 
   room.joinSessions.set(session.sessionId, session);
@@ -216,6 +228,22 @@ app.post("/rooms/:roomId/sessions/:sessionId/client-candidates", (req, res) => {
   return res.sendStatus(204);
 });
 
+app.post("/rooms/:roomId/sessions/:sessionId/client-observation", (req, res) => {
+  const room = getRoom(req.params.roomId);
+  if (!room) return res.sendStatus(404);
+
+  const session = getSession(room, req.params.sessionId);
+  if (!session) return res.sendStatus(404);
+
+  const observedHostCandidate = normalizeSingleCandidate(req.body?.observedHostCandidate);
+  const selectedClientCandidate = normalizeSingleCandidate(req.body?.selectedClientCandidate);
+  if (observedHostCandidate) session.clientObservedHostCandidate = observedHostCandidate;
+  if (selectedClientCandidate) session.selectedClientCandidate = selectedClientCandidate;
+  session.lastSeen = Date.now();
+  room.joinSessions.set(session.sessionId, session);
+  return res.sendStatus(204);
+});
+
 app.get("/rooms/:roomId/pending-sessions", (req, res) => {
   const room = getRoom(req.params.roomId);
   if (!room) return res.sendStatus(404);
@@ -229,10 +257,16 @@ app.get("/rooms/:roomId/pending-sessions", (req, res) => {
       sessionId: session.sessionId,
       createdAtUnixMs: session.createdAt,
       expiresAtUnixMs: session.lastSeen + SESSION_TIMEOUT_MS,
+      hostReady: Boolean(session.hostReady),
+      controllingRole: session.controllingRole ?? "host",
       clientCandidates: session.clientCandidates,
       hostCandidates: Array.isArray(session.hostCandidates) && session.hostCandidates.length > 0
         ? session.hostCandidates
-        : buildPublishedCandidate(room)
+        : buildPublishedCandidate(room),
+      clientObservedHostCandidate: session.clientObservedHostCandidate ?? null,
+      selectedHostCandidate: session.selectedHostCandidate ?? null,
+      selectedClientCandidate: session.selectedClientCandidate ?? null,
+      nominated: Boolean(session.nominated)
     });
   }
 
@@ -258,6 +292,30 @@ app.post("/rooms/:roomId/sessions/:sessionId/host-ready", (req, res) => {
   return res.sendStatus(204);
 });
 
+app.post("/rooms/:roomId/sessions/:sessionId/nominate", (req, res) => {
+  const room = getRoom(req.params.roomId);
+  if (!room) return res.sendStatus(404);
+
+  const session = getSession(room, req.params.sessionId);
+  if (!session) return res.sendStatus(404);
+
+  const selectedHostCandidate = normalizeSingleCandidate(req.body?.selectedHostCandidate);
+  const selectedClientCandidate = normalizeSingleCandidate(req.body?.selectedClientCandidate);
+  if (!selectedHostCandidate || !selectedClientCandidate) {
+    return res.status(400).json({ error: "selectedHostCandidate and selectedClientCandidate are required" });
+  }
+
+  session.selectedHostCandidate = selectedHostCandidate;
+  session.selectedClientCandidate = selectedClientCandidate;
+  session.nominated = true;
+  session.nominatedBy = "host";
+  session.nominatedAtUnixMs = Date.now();
+  session.hostReady = true;
+  session.lastSeen = Date.now();
+  room.joinSessions.set(session.sessionId, session);
+  return res.sendStatus(204);
+});
+
 app.get("/rooms/:roomId/sessions/:sessionId", (req, res) => {
   const room = getRoom(req.params.roomId);
   if (!room) return res.sendStatus(404);
@@ -269,10 +327,17 @@ app.get("/rooms/:roomId/sessions/:sessionId", (req, res) => {
     sessionId: session.sessionId,
     roomId: room.roomId,
     hostReady: Boolean(session.hostReady),
+    controllingRole: session.controllingRole ?? "host",
     clientCandidatesSubmitted: Array.isArray(session.clientCandidates) && session.clientCandidates.length > 0,
     hostCandidates: Array.isArray(session.hostCandidates) && session.hostCandidates.length > 0
       ? session.hostCandidates
       : buildPublishedCandidate(room),
+    clientObservedHostCandidate: session.clientObservedHostCandidate ?? null,
+    selectedHostCandidate: session.selectedHostCandidate ?? null,
+    selectedClientCandidate: session.selectedClientCandidate ?? null,
+    nominated: Boolean(session.nominated),
+    nominatedBy: session.nominatedBy ?? null,
+    nominatedAtUnixMs: session.nominatedAtUnixMs ?? null,
     createdAtUnixMs: session.createdAt,
     expiresAtUnixMs: session.lastSeen + SESSION_TIMEOUT_MS
   });
