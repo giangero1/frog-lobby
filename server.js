@@ -111,6 +111,24 @@ function getSession(room, sessionId) {
   return room.joinSessions?.get(sessionId) ?? null;
 }
 
+app.get("/health", (_req, res) => {
+  pruneRooms();
+  let joinSessionCount = 0;
+  for (const room of rooms.values()) {
+    if (room.joinSessions instanceof Map)
+      joinSessionCount += room.joinSessions.size;
+  }
+
+  return res.json({
+    ok: true,
+    service: "frog-lobby",
+    traversalEnabled: true,
+    roomCount: rooms.size,
+    joinSessionCount,
+    nowUnixMs: Date.now()
+  });
+});
+
 app.post("/rooms", (req, res) => {
   const {
     roomId,
