@@ -9,6 +9,14 @@ app.use(express.json());
 const rooms = new Map();
 const HEARTBEAT_TIMEOUT_MS = 60 * 1000;
 const SESSION_TIMEOUT_MS = 2 * 60 * 1000;
+const EDGEGAP_LOBBY_URL = (process.env.EDGEGAP_LOBBY_URL ?? "").trim();
+const EDGEGAP_REGION = (process.env.EDGEGAP_REGION ?? "").trim() || null;
+const RELAY_ENABLED = EDGEGAP_LOBBY_URL.length > 0;
+const RELAY_PROVIDER = RELAY_ENABLED ? "edgegap" : null;
+const LEGACY_DIRECT_ENABLED = (process.env.LEGACY_DIRECT_ENABLED ?? "true").toLowerCase() !== "false";
+const CONFIGURED_DEFAULT_INTERNET_MODE = (process.env.DEFAULT_INTERNET_MODE ?? "").trim().toLowerCase();
+const DEFAULT_INTERNET_MODE = CONFIGURED_DEFAULT_INTERNET_MODE || (RELAY_ENABLED ? "relay" : "direct");
+const RELAY_LOBBY_WAIT_TIMEOUT_SECONDS = Math.max(5, Number.parseInt(process.env.RELAY_LOBBY_WAIT_TIMEOUT_SECONDS ?? "30", 10) || 30);
 
 function pruneRooms() {
   const now = Date.now();
@@ -68,6 +76,14 @@ function normalizeSingleCandidate(candidate) {
   return normalized.length > 0 ? normalized[0] : null;
 }
 
+function normalizeInternetMode(mode) {
+  return typeof mode === "string" && mode.toLowerCase() === "relay" ? "relay" : "direct";
+}
+
+function getRoomInternetMode(room) {
+  return normalizeInternetMode(room?.internetMode ?? DEFAULT_INTERNET_MODE);
+}
+
 function buildPublishedCandidate(room) {
   if (!room.externalAddress || !room.externalPort) return [];
 
@@ -81,6 +97,7 @@ function buildPublishedCandidate(room) {
 }
 
 function buildJoinResponse(room, session) {
+  const internetMode = getRoomInternetMode(room);
   return {
     roomId: room.roomId,
     roomName: room.roomName,
@@ -91,6 +108,12 @@ function buildJoinResponse(room, session) {
     regionLabel: room.regionLabel ?? null,
     transportType: room.transportType ?? null,
     natTraversalEnabled: Boolean(room.natTraversalEnabled),
+    internetMode,
+    relayProvider: room.relayProvider ?? (internetMode === "relay" ? RELAY_PROVIDER : null),
+    relayLobbyId: room.relayLobbyId ?? null,
+    relayLobbyUrl: room.relayLobbyUrl ?? (internetMode === "relay" ? EDGEGAP_LOBBY_URL || null : null),
+    relayRegion: room.relayRegion ?? EDGEGAP_REGION,
+    relayReady: Boolean(room.relayReady),
     hostCandidates: Array.isArray(session?.hostCandidates) && session.hostCandidates.length > 0
       ? session.hostCandidates
       : (Array.isArray(room.hostCandidates) && room.hostCandidates.length > 0
@@ -111,6 +134,18 @@ function getSession(room, sessionId) {
   return room.joinSessions?.get(sessionId) ?? null;
 }
 
+function buildConfigPayload() {
+  return {
+    defaultInternetMode: DEFAULT_INTERNET_MODE,
+    relayEnabled: RELAY_ENABLED,
+    legacyDirectEnabled: LEGACY_DIRECT_ENABLED,
+    relayProvider: RELAY_PROVIDER,
+    relayLobbyUrl: EDGEGAP_LOBBY_URL || null,
+    relayRegion: EDGEGAP_REGION,
+    relayLobbyWaitTimeoutSeconds: RELAY_LOBBY_WAIT_TIMEOUT_SECONDS
+  };
+}
+
 app.get("/health", (_req, res) => {
   pruneRooms();
   let joinSessionCount = 0;
@@ -123,10 +158,15 @@ app.get("/health", (_req, res) => {
     ok: true,
     service: "frog-lobby",
     traversalEnabled: true,
+    ...buildConfigPayload(),
     roomCount: rooms.size,
     joinSessionCount,
     nowUnixMs: Date.now()
   });
+});
+
+app.get("/config", (_req, res) => {
+  return res.json(buildConfigPayload());
 });
 
 app.post("/rooms", (req, res) => {
@@ -143,7 +183,13 @@ app.post("/rooms", (req, res) => {
     regionLabel,
     transportType,
     natTraversalEnabled = false,
-    hostCandidates
+    hostCandidates,
+    internetMode,
+    relayProvider,
+    relayLobbyId,
+    relayLobbyUrl,
+    relayRegion,
+    relayReady = false
   } = req.body;
 
   if (!roomId) return res.status(400).json({ error: "roomId required" });
@@ -168,6 +214,12 @@ app.post("/rooms", (req, res) => {
     transportType,
     natTraversalEnabled,
     hostCandidates: normalizeCandidates(hostCandidates),
+    internetMode: normalizeInternetMode(internetMode),
+    relayProvider: typeof relayProvider === "string" ? relayProvider : RELAY_PROVIDER,
+    relayLobbyId: typeof relayLobbyId === "string" ? relayLobbyId : null,
+    relayLobbyUrl: typeof relayLobbyUrl === "string" ? relayLobbyUrl : (EDGEGAP_LOBBY_URL || null),
+    relayRegion: typeof relayRegion === "string" && relayRegion.length > 0 ? relayRegion : EDGEGAP_REGION,
+    relayReady: Boolean(relayReady),
     passwordHash,
     passwordSalt,
     lastSeen: Date.now(),
@@ -181,6 +233,7 @@ app.get("/rooms", (_req, res) => {
   pruneRooms();
   const payload = [];
   for (const room of rooms.values()) {
+    const internetMode = getRoomInternetMode(room);
     payload.push({
       roomId: room.roomId,
       roomName: room.roomName,
@@ -193,7 +246,13 @@ app.get("/rooms", (_req, res) => {
       requiresPassword: Boolean(room.passwordHash),
       regionLabel: room.regionLabel ?? null,
       transportType: room.transportType ?? null,
-      natTraversalEnabled: Boolean(room.natTraversalEnabled)
+      natTraversalEnabled: Boolean(room.natTraversalEnabled),
+      internetMode,
+      relayProvider: room.relayProvider ?? (internetMode === "relay" ? RELAY_PROVIDER : null),
+      relayLobbyId: room.relayLobbyId ?? null,
+      relayLobbyUrl: room.relayLobbyUrl ?? (internetMode === "relay" ? EDGEGAP_LOBBY_URL || null : null),
+      relayRegion: room.relayRegion ?? EDGEGAP_REGION,
+      relayReady: Boolean(room.relayReady)
     });
   }
   res.json(payload);
@@ -207,6 +266,12 @@ app.post("/rooms/:roomId/join", (req, res) => {
     const provided = req.body?.password ?? "";
     const hashed = hashPassword(provided, room.passwordSalt);
     if (hashed !== room.passwordHash) return res.sendStatus(401);
+  }
+
+  if (getRoomInternetMode(room) === "relay") {
+    room.lastSeen = Date.now();
+    rooms.set(room.roomId, room);
+    return res.json(buildJoinResponse(room, null));
   }
 
   const now = Date.now();
@@ -266,10 +331,13 @@ app.get("/rooms/:roomId/pending-sessions", (req, res) => {
   const room = getRoom(req.params.roomId);
   if (!room) return res.sendStatus(404);
 
+  if (getRoomInternetMode(room) === "relay")
+    return res.json({ sessions: [] });
+
   const sessions = [];
   for (const session of room.joinSessions.values()) {
     if (!Array.isArray(session.clientCandidates) || session.clientCandidates.length === 0) continue;
-    if (session.hostReady) continue;
+    if (session.nominated) continue;
 
     sessions.push({
       sessionId: session.sessionId,
@@ -372,6 +440,12 @@ app.put("/rooms/:roomId/heartbeat", (req, res) => {
   if (typeof req.body?.regionLabel === "string") room.regionLabel = req.body.regionLabel;
   if (typeof req.body?.transportType === "string") room.transportType = req.body.transportType;
   if (typeof req.body?.natTraversalEnabled === "boolean") room.natTraversalEnabled = req.body.natTraversalEnabled;
+  if (typeof req.body?.internetMode === "string") room.internetMode = normalizeInternetMode(req.body.internetMode);
+  if (typeof req.body?.relayProvider === "string") room.relayProvider = req.body.relayProvider;
+  if (typeof req.body?.relayLobbyId === "string") room.relayLobbyId = req.body.relayLobbyId;
+  if (typeof req.body?.relayLobbyUrl === "string") room.relayLobbyUrl = req.body.relayLobbyUrl;
+  if (typeof req.body?.relayRegion === "string") room.relayRegion = req.body.relayRegion;
+  if (typeof req.body?.relayReady === "boolean") room.relayReady = req.body.relayReady;
 
   const hostCandidates = normalizeCandidates(req.body?.hostCandidates);
   if (hostCandidates.length > 0)
