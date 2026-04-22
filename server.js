@@ -10,13 +10,33 @@ const rooms = new Map();
 const HEARTBEAT_TIMEOUT_MS = 60 * 1000;
 const SESSION_TIMEOUT_MS = 2 * 60 * 1000;
 const EDGEGAP_LOBBY_URL = (process.env.EDGEGAP_LOBBY_URL ?? "").trim();
-const EDGEGAP_REGION = (process.env.EDGEGAP_REGION ?? "").trim() || null;
-const RELAY_ENABLED = EDGEGAP_LOBBY_URL.length > 0;
-const RELAY_PROVIDER = RELAY_ENABLED ? "edgegap" : null;
+const RELAY_REGION = (process.env.UNITY_RELAY_REGION ?? process.env.EDGEGAP_REGION ?? "").trim() || null;
+const RELAY_PROVIDER_SETTING = normalizeRelayProvider(process.env.RELAY_PROVIDER ?? process.env.DEFAULT_RELAY_PROVIDER ?? "");
+const UNITY_RELAY_ENABLED = isTruthy(process.env.UNITY_RELAY_ENABLED) || RELAY_PROVIDER_SETTING === "unity";
+const EDGEGAP_RELAY_ENABLED = EDGEGAP_LOBBY_URL.length > 0;
+const RELAY_PROVIDER = RELAY_PROVIDER_SETTING || (UNITY_RELAY_ENABLED ? "unity" : (EDGEGAP_RELAY_ENABLED ? "edgegap" : null));
+const RELAY_ENABLED = RELAY_PROVIDER === "unity"
+  ? UNITY_RELAY_ENABLED
+  : RELAY_PROVIDER === "edgegap" && EDGEGAP_RELAY_ENABLED;
 const LEGACY_DIRECT_ENABLED = (process.env.LEGACY_DIRECT_ENABLED ?? "true").toLowerCase() !== "false";
 const CONFIGURED_DEFAULT_INTERNET_MODE = (process.env.DEFAULT_INTERNET_MODE ?? "").trim().toLowerCase();
-const DEFAULT_INTERNET_MODE = CONFIGURED_DEFAULT_INTERNET_MODE || (RELAY_ENABLED ? "relay" : "direct");
+const DEFAULT_INTERNET_MODE = CONFIGURED_DEFAULT_INTERNET_MODE === "relay" && RELAY_ENABLED
+  ? "relay"
+  : CONFIGURED_DEFAULT_INTERNET_MODE === "direct"
+    ? "direct"
+    : (RELAY_ENABLED ? "relay" : "direct");
 const RELAY_LOBBY_WAIT_TIMEOUT_SECONDS = Math.max(5, Number.parseInt(process.env.RELAY_LOBBY_WAIT_TIMEOUT_SECONDS ?? "30", 10) || 30);
+
+function isTruthy(value) {
+  return ["1", "true", "yes", "y", "on"].includes(String(value ?? "").trim().toLowerCase());
+}
+
+function normalizeRelayProvider(provider) {
+  const normalized = String(provider ?? "").trim().toLowerCase();
+  if (normalized === "unity-relay") return "unity";
+  if (normalized === "unity" || normalized === "edgegap") return normalized;
+  return "";
+}
 
 function pruneRooms() {
   const now = Date.now();
@@ -111,8 +131,9 @@ function buildJoinResponse(room, session) {
     internetMode,
     relayProvider: room.relayProvider ?? (internetMode === "relay" ? RELAY_PROVIDER : null),
     relayLobbyId: room.relayLobbyId ?? null,
-    relayLobbyUrl: room.relayLobbyUrl ?? (internetMode === "relay" ? EDGEGAP_LOBBY_URL || null : null),
-    relayRegion: room.relayRegion ?? EDGEGAP_REGION,
+    relayJoinCode: room.relayJoinCode ?? (room.relayProvider === "unity" ? room.relayLobbyId ?? null : null),
+    relayLobbyUrl: room.relayLobbyUrl ?? (internetMode === "relay" && RELAY_PROVIDER === "edgegap" ? EDGEGAP_LOBBY_URL || null : null),
+    relayRegion: room.relayRegion ?? RELAY_REGION,
     relayReady: Boolean(room.relayReady),
     hostCandidates: Array.isArray(session?.hostCandidates) && session.hostCandidates.length > 0
       ? session.hostCandidates
@@ -140,8 +161,9 @@ function buildConfigPayload() {
     relayEnabled: RELAY_ENABLED,
     legacyDirectEnabled: LEGACY_DIRECT_ENABLED,
     relayProvider: RELAY_PROVIDER,
-    relayLobbyUrl: EDGEGAP_LOBBY_URL || null,
-    relayRegion: EDGEGAP_REGION,
+    relayLobbyUrl: RELAY_PROVIDER === "edgegap" ? EDGEGAP_LOBBY_URL || null : null,
+    relayRegion: RELAY_REGION,
+    unityRelayEnabled: RELAY_PROVIDER === "unity" && RELAY_ENABLED,
     relayLobbyWaitTimeoutSeconds: RELAY_LOBBY_WAIT_TIMEOUT_SECONDS
   };
 }
@@ -187,6 +209,7 @@ app.post("/rooms", (req, res) => {
     internetMode,
     relayProvider,
     relayLobbyId,
+    relayJoinCode,
     relayLobbyUrl,
     relayRegion,
     relayReady = false
@@ -200,6 +223,12 @@ app.post("/rooms", (req, res) => {
     passwordSalt = crypto.randomBytes(16).toString("hex");
     passwordHash = hashPassword(password, passwordSalt);
   }
+
+  const publishedRelayProvider = normalizeRelayProvider(relayProvider) || RELAY_PROVIDER;
+  const publishedRelayLobbyId = typeof relayLobbyId === "string" ? relayLobbyId : null;
+  const publishedRelayJoinCode = typeof relayJoinCode === "string"
+    ? relayJoinCode
+    : (publishedRelayProvider === "unity" ? publishedRelayLobbyId : null);
 
   rooms.set(roomId, {
     roomId,
@@ -215,10 +244,11 @@ app.post("/rooms", (req, res) => {
     natTraversalEnabled,
     hostCandidates: normalizeCandidates(hostCandidates),
     internetMode: normalizeInternetMode(internetMode),
-    relayProvider: typeof relayProvider === "string" ? relayProvider : RELAY_PROVIDER,
-    relayLobbyId: typeof relayLobbyId === "string" ? relayLobbyId : null,
-    relayLobbyUrl: typeof relayLobbyUrl === "string" ? relayLobbyUrl : (EDGEGAP_LOBBY_URL || null),
-    relayRegion: typeof relayRegion === "string" && relayRegion.length > 0 ? relayRegion : EDGEGAP_REGION,
+    relayProvider: publishedRelayProvider,
+    relayLobbyId: publishedRelayLobbyId,
+    relayJoinCode: publishedRelayJoinCode,
+    relayLobbyUrl: typeof relayLobbyUrl === "string" ? relayLobbyUrl : (RELAY_PROVIDER === "edgegap" ? EDGEGAP_LOBBY_URL || null : null),
+    relayRegion: typeof relayRegion === "string" && relayRegion.length > 0 ? relayRegion : RELAY_REGION,
     relayReady: Boolean(relayReady),
     passwordHash,
     passwordSalt,
@@ -250,8 +280,9 @@ app.get("/rooms", (_req, res) => {
       internetMode,
       relayProvider: room.relayProvider ?? (internetMode === "relay" ? RELAY_PROVIDER : null),
       relayLobbyId: room.relayLobbyId ?? null,
-      relayLobbyUrl: room.relayLobbyUrl ?? (internetMode === "relay" ? EDGEGAP_LOBBY_URL || null : null),
-      relayRegion: room.relayRegion ?? EDGEGAP_REGION,
+      relayJoinCode: room.relayJoinCode ?? (room.relayProvider === "unity" ? room.relayLobbyId ?? null : null),
+      relayLobbyUrl: room.relayLobbyUrl ?? (internetMode === "relay" && RELAY_PROVIDER === "edgegap" ? EDGEGAP_LOBBY_URL || null : null),
+      relayRegion: room.relayRegion ?? RELAY_REGION,
       relayReady: Boolean(room.relayReady)
     });
   }
@@ -441,8 +472,9 @@ app.put("/rooms/:roomId/heartbeat", (req, res) => {
   if (typeof req.body?.transportType === "string") room.transportType = req.body.transportType;
   if (typeof req.body?.natTraversalEnabled === "boolean") room.natTraversalEnabled = req.body.natTraversalEnabled;
   if (typeof req.body?.internetMode === "string") room.internetMode = normalizeInternetMode(req.body.internetMode);
-  if (typeof req.body?.relayProvider === "string") room.relayProvider = req.body.relayProvider;
+  if (typeof req.body?.relayProvider === "string") room.relayProvider = normalizeRelayProvider(req.body.relayProvider) || req.body.relayProvider;
   if (typeof req.body?.relayLobbyId === "string") room.relayLobbyId = req.body.relayLobbyId;
+  if (typeof req.body?.relayJoinCode === "string") room.relayJoinCode = req.body.relayJoinCode;
   if (typeof req.body?.relayLobbyUrl === "string") room.relayLobbyUrl = req.body.relayLobbyUrl;
   if (typeof req.body?.relayRegion === "string") room.relayRegion = req.body.relayRegion;
   if (typeof req.body?.relayReady === "boolean") room.relayReady = req.body.relayReady;
