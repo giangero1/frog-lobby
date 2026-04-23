@@ -3,6 +3,7 @@ import cors from "cors";
 import crypto from "crypto";
 
 const app = express();
+app.set("trust proxy", true);
 app.use(cors());
 app.use(express.json());
 
@@ -11,6 +12,10 @@ const HEARTBEAT_TIMEOUT_MS = 60 * 1000;
 const SESSION_TIMEOUT_MS = 2 * 60 * 1000;
 const EDGEGAP_LOBBY_URL = (process.env.EDGEGAP_LOBBY_URL ?? "").trim();
 const RELAY_REGION = (process.env.UNITY_RELAY_REGION ?? process.env.EDGEGAP_REGION ?? "").trim() || null;
+const UNITY_RELAY_REGION_AUTO_GEO = isTruthy(process.env.UNITY_RELAY_REGION_AUTO_GEO);
+const GEO_LOOKUP_URL_TEMPLATE = (process.env.RELAY_REGION_GEO_LOOKUP_URL_TEMPLATE ?? "https://ipinfo.io/{ip}/country").trim();
+const GEO_LOOKUP_TIMEOUT_MS = Math.max(500, Number.parseInt(process.env.RELAY_REGION_GEO_LOOKUP_TIMEOUT_MS ?? "1500", 10) || 1500);
+const GEO_LOOKUP_CACHE_TTL_MS = Math.max(60_000, Number.parseInt(process.env.RELAY_REGION_GEO_CACHE_SECONDS ?? "21600", 10) * 1000 || 21_600_000);
 const RELAY_PROVIDER_SETTING = normalizeRelayProvider(process.env.RELAY_PROVIDER ?? process.env.DEFAULT_RELAY_PROVIDER ?? "");
 const UNITY_RELAY_ENABLED = isTruthy(process.env.UNITY_RELAY_ENABLED) || RELAY_PROVIDER_SETTING === "unity";
 const EDGEGAP_RELAY_ENABLED = EDGEGAP_LOBBY_URL.length > 0;
@@ -26,6 +31,28 @@ const DEFAULT_INTERNET_MODE = CONFIGURED_DEFAULT_INTERNET_MODE === "relay" && RE
     ? "direct"
     : (RELAY_ENABLED ? "relay" : "direct");
 const RELAY_LOBBY_WAIT_TIMEOUT_SECONDS = Math.max(5, Number.parseInt(process.env.RELAY_LOBBY_WAIT_TIMEOUT_SECONDS ?? "30", 10) || 30);
+const geoLookupCache = new Map();
+
+const EUROPE_CENTRAL_RELAY_COUNTRIES = new Set([
+  "AL", "AT", "BA", "BG", "CH", "CZ", "DE", "GR", "HR", "HU", "IT", "LI",
+  "MD", "ME", "MK", "PL", "RO", "RS", "SI", "SK", "TR", "UA", "XK"
+]);
+const EUROPE_WEST_RELAY_COUNTRIES = new Set([
+  "AD", "BE", "ES", "FR", "GB", "IE", "LU", "MC", "NL", "PT", "UK"
+]);
+const EUROPE_NORTH_RELAY_COUNTRIES = new Set([
+  "DK", "EE", "FI", "IS", "LT", "LV", "NO", "SE"
+]);
+const ASIA_NORTHEAST_RELAY_COUNTRIES = new Set(["HK", "JP", "KR", "MO", "MN", "TW"]);
+const ASIA_SOUTH_RELAY_COUNTRIES = new Set([
+  "AF", "BD", "BH", "BT", "IN", "IR", "KW", "LK", "MV", "NP", "OM", "PK",
+  "QA", "SA", "AE", "YE"
+]);
+const ASIA_SOUTHEAST_RELAY_COUNTRIES = new Set(["BN", "KH", "ID", "LA", "MY", "MM", "PH", "SG", "TH", "VN"]);
+const AUSTRALIA_RELAY_COUNTRIES = new Set(["AU", "FJ", "NZ", "PG"]);
+const SOUTH_AMERICA_RELAY_COUNTRIES = new Set(["AR", "BO", "BR", "CL", "CO", "EC", "GY", "PE", "PY", "SR", "UY", "VE"]);
+const NORTH_AMERICA_RELAY_COUNTRIES = new Set(["CA", "MX", "US"]);
+const MENA_EUROPE_RELAY_COUNTRIES = new Set(["CY", "DZ", "EG", "IL", "JO", "LB", "LY", "MA", "PS", "SY", "TN"]);
 
 function isTruthy(value) {
   return ["1", "true", "yes", "y", "on"].includes(String(value ?? "").trim().toLowerCase());
@@ -36,6 +63,181 @@ function normalizeRelayProvider(provider) {
   if (normalized === "unity-relay") return "unity";
   if (normalized === "unity" || normalized === "edgegap") return normalized;
   return "";
+}
+
+function getRequesterIp(req) {
+  const forwarded = req?.headers?.["x-forwarded-for"];
+  const forwardedValue = Array.isArray(forwarded) ? forwarded[0] : forwarded;
+  const firstForwardedIp = typeof forwardedValue === "string"
+    ? forwardedValue.split(",").map(part => part.trim()).find(Boolean)
+    : "";
+  return normalizeIp(firstForwardedIp || req?.ip || req?.socket?.remoteAddress || "");
+}
+
+function normalizeIp(raw) {
+  let value = String(raw ?? "").trim();
+  if (!value) return "";
+  if (value.startsWith("::ffff:"))
+    value = value.slice("::ffff:".length);
+  if (value.startsWith("[") && value.includes("]"))
+    value = value.slice(1, value.indexOf("]"));
+  if (/^\d{1,3}(?:\.\d{1,3}){3}:\d+$/.test(value))
+    value = value.slice(0, value.lastIndexOf(":"));
+  return value;
+}
+
+function isPrivateOrLocalIp(ip) {
+  if (!ip) return true;
+  const value = ip.toLowerCase();
+  if (value === "::1" || value === "localhost")
+    return true;
+  if (value.startsWith("fc") || value.startsWith("fd") || value.startsWith("fe80:"))
+    return true;
+
+  const parts = value.split(".").map(part => Number.parseInt(part, 10));
+  if (parts.length !== 4 || parts.some(part => Number.isNaN(part)))
+    return false;
+
+  const [a, b] = parts;
+  return a === 10 ||
+    a === 127 ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    (a === 169 && b === 254);
+}
+
+function maskIpPrefix(ip) {
+  if (!ip) return null;
+  if (isPrivateOrLocalIp(ip)) return "private";
+
+  const ipv4 = ip.split(".");
+  if (ipv4.length === 4 && ipv4.every(part => /^\d{1,3}$/.test(part)))
+    return `${ipv4[0]}.${ipv4[1]}.x.x`;
+
+  if (ip.includes(":")) {
+    const groups = ip.split(":").filter(Boolean);
+    return groups.length > 0 ? `${groups.slice(0, 4).join(":")}::/64` : "ipv6";
+  }
+
+  return "unknown";
+}
+
+function normalizeCountryCode(raw) {
+  const match = String(raw ?? "").trim().toUpperCase().match(/[A-Z]{2}/);
+  return match ? match[0] : null;
+}
+
+function parseCountryLookupResponse(raw) {
+  const text = String(raw ?? "").trim();
+  if (!text) return null;
+
+  if (text.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(text);
+      return normalizeCountryCode(parsed.country ?? parsed.countryCode ?? parsed.country_code);
+    } catch {
+      return null;
+    }
+  }
+
+  return normalizeCountryCode(text);
+}
+
+function mapCountryToRelayRegion(countryCode) {
+  const country = normalizeCountryCode(countryCode);
+  if (!country) return null;
+  if (EUROPE_CENTRAL_RELAY_COUNTRIES.has(country)) return "europe-central2";
+  if (EUROPE_WEST_RELAY_COUNTRIES.has(country)) return "europe-west4";
+  if (EUROPE_NORTH_RELAY_COUNTRIES.has(country)) return "europe-north1";
+  if (MENA_EUROPE_RELAY_COUNTRIES.has(country)) return "europe-central2";
+  if (NORTH_AMERICA_RELAY_COUNTRIES.has(country)) return "us-central1";
+  if (SOUTH_AMERICA_RELAY_COUNTRIES.has(country)) return "southamerica-east1";
+  if (ASIA_NORTHEAST_RELAY_COUNTRIES.has(country)) return "asia-northeast1";
+  if (ASIA_SOUTH_RELAY_COUNTRIES.has(country)) return "asia-south1";
+  if (ASIA_SOUTHEAST_RELAY_COUNTRIES.has(country)) return "asia-southeast1";
+  if (AUSTRALIA_RELAY_COUNTRIES.has(country)) return "australia-southeast1";
+  return null;
+}
+
+async function lookupCountryForIp(ip) {
+  if (!ip || isPrivateOrLocalIp(ip) || !GEO_LOOKUP_URL_TEMPLATE)
+    return null;
+
+  const now = Date.now();
+  const cached = geoLookupCache.get(ip);
+  if (cached && cached.expiresAt > now)
+    return cached.country;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), GEO_LOOKUP_TIMEOUT_MS);
+  try {
+    const url = GEO_LOOKUP_URL_TEMPLATE.replace("{ip}", encodeURIComponent(ip));
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: { "user-agent": "frog-lobby/1.0" }
+    });
+    if (!response.ok)
+      throw new Error(`geo lookup returned ${response.status}`);
+
+    const country = parseCountryLookupResponse(await response.text());
+    geoLookupCache.set(ip, { country, expiresAt: now + GEO_LOOKUP_CACHE_TTL_MS });
+    return country;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function resolveRelayRegionForRequest(req) {
+  const ip = getRequesterIp(req);
+  const ipPrefix = maskIpPrefix(ip);
+
+  if (RELAY_REGION) {
+    return {
+      region: RELAY_REGION,
+      source: "forced",
+      country: null,
+      ipPrefix
+    };
+  }
+
+  if (!UNITY_RELAY_REGION_AUTO_GEO) {
+    return {
+      region: null,
+      source: "unity-auto",
+      country: null,
+      ipPrefix
+    };
+  }
+
+  try {
+    const country = await lookupCountryForIp(ip);
+    const region = mapCountryToRelayRegion(country);
+    if (region) {
+      return {
+        region,
+        source: "geo-ip",
+        country,
+        ipPrefix
+      };
+    }
+
+    return {
+      region: null,
+      source: "unity-auto",
+      country,
+      ipPrefix
+    };
+  } catch (error) {
+    if (isTruthy(process.env.RELAY_REGION_GEO_DEBUG))
+      console.warn(`[config] Geo relay region lookup failed for ${ipPrefix ?? "unknown"}: ${error.message}`);
+
+    return {
+      region: null,
+      source: "unity-auto",
+      country: null,
+      ipPrefix
+    };
+  }
 }
 
 function pruneRooms() {
@@ -155,20 +357,24 @@ function getSession(room, sessionId) {
   return room.joinSessions?.get(sessionId) ?? null;
 }
 
-function buildConfigPayload() {
+async function buildConfigPayload(req = null) {
+  const relayRegionSelection = await resolveRelayRegionForRequest(req);
   return {
     defaultInternetMode: DEFAULT_INTERNET_MODE,
     relayEnabled: RELAY_ENABLED,
     legacyDirectEnabled: LEGACY_DIRECT_ENABLED,
     relayProvider: RELAY_PROVIDER,
     relayLobbyUrl: RELAY_PROVIDER === "edgegap" ? EDGEGAP_LOBBY_URL || null : null,
-    relayRegion: RELAY_REGION,
+    relayRegion: relayRegionSelection.region,
+    relayRegionSource: relayRegionSelection.source,
+    relayRegionCountry: relayRegionSelection.country,
+    relayRegionIpPrefix: relayRegionSelection.ipPrefix,
     unityRelayEnabled: RELAY_PROVIDER === "unity" && RELAY_ENABLED,
     relayLobbyWaitTimeoutSeconds: RELAY_LOBBY_WAIT_TIMEOUT_SECONDS
   };
 }
 
-app.get("/health", (_req, res) => {
+app.get("/health", async (req, res) => {
   pruneRooms();
   let joinSessionCount = 0;
   for (const room of rooms.values()) {
@@ -180,15 +386,15 @@ app.get("/health", (_req, res) => {
     ok: true,
     service: "frog-lobby",
     traversalEnabled: true,
-    ...buildConfigPayload(),
+    ...(await buildConfigPayload(req)),
     roomCount: rooms.size,
     joinSessionCount,
     nowUnixMs: Date.now()
   });
 });
 
-app.get("/config", (_req, res) => {
-  return res.json(buildConfigPayload());
+app.get("/config", async (req, res) => {
+  return res.json(await buildConfigPayload(req));
 });
 
 app.post("/rooms", (req, res) => {
