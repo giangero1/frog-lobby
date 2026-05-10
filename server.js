@@ -302,6 +302,12 @@ function normalizeInternetMode(mode) {
   return typeof mode === "string" && mode.toLowerCase() === "relay" ? "relay" : "direct";
 }
 
+function directInternetDisabledResponse(res) {
+  return res.status(403).json({
+    error: "Direct internet rooms are disabled. Use Unity Relay for online rooms."
+  });
+}
+
 function getRoomInternetMode(room) {
   return normalizeInternetMode(room?.internetMode ?? DEFAULT_INTERNET_MODE);
 }
@@ -423,6 +429,10 @@ app.post("/rooms", (req, res) => {
 
   if (!roomId) return res.status(400).json({ error: "roomId required" });
 
+  const publishedInternetMode = normalizeInternetMode(internetMode);
+  if (publishedInternetMode === "direct" && !LEGACY_DIRECT_ENABLED)
+    return directInternetDisabledResponse(res);
+
   let passwordSalt = null;
   let passwordHash = null;
   if (password && password.length > 0) {
@@ -449,7 +459,7 @@ app.post("/rooms", (req, res) => {
     transportType,
     natTraversalEnabled,
     hostCandidates: normalizeCandidates(hostCandidates),
-    internetMode: normalizeInternetMode(internetMode),
+    internetMode: publishedInternetMode,
     relayProvider: publishedRelayProvider,
     relayLobbyId: publishedRelayLobbyId,
     relayJoinCode: publishedRelayJoinCode,
@@ -670,6 +680,12 @@ app.put("/rooms/:roomId/heartbeat", (req, res) => {
   const room = getRoom(req.params.roomId);
   if (!room) return res.sendStatus(404);
 
+  const requestedInternetMode = typeof req.body?.internetMode === "string"
+    ? normalizeInternetMode(req.body.internetMode)
+    : getRoomInternetMode(room);
+  if (requestedInternetMode === "direct" && !LEGACY_DIRECT_ENABLED)
+    return directInternetDisabledResponse(res);
+
   if (typeof req.body?.currentPlayers === "number") room.currentPlayers = req.body.currentPlayers;
   if (typeof req.body?.externalAddress === "string" && req.body.externalAddress.length > 0) room.externalAddress = req.body.externalAddress;
   if (Number.isInteger(req.body?.externalPort) && req.body.externalPort > 0 && req.body.externalPort <= 65535) room.externalPort = req.body.externalPort;
@@ -677,7 +693,7 @@ app.put("/rooms/:roomId/heartbeat", (req, res) => {
   if (typeof req.body?.regionLabel === "string") room.regionLabel = req.body.regionLabel;
   if (typeof req.body?.transportType === "string") room.transportType = req.body.transportType;
   if (typeof req.body?.natTraversalEnabled === "boolean") room.natTraversalEnabled = req.body.natTraversalEnabled;
-  if (typeof req.body?.internetMode === "string") room.internetMode = normalizeInternetMode(req.body.internetMode);
+  if (typeof req.body?.internetMode === "string") room.internetMode = requestedInternetMode;
   if (typeof req.body?.relayProvider === "string") room.relayProvider = normalizeRelayProvider(req.body.relayProvider) || req.body.relayProvider;
   if (typeof req.body?.relayLobbyId === "string") room.relayLobbyId = req.body.relayLobbyId;
   if (typeof req.body?.relayJoinCode === "string") room.relayJoinCode = req.body.relayJoinCode;
