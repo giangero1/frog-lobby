@@ -360,9 +360,15 @@ async function authenticateSessionTicket(sessionTicket) {
     throw error;
   }
 
-  const data = await playFabServerRequest("/Server/AuthenticateSessionTicket", {
-    SessionTicket: ticket
-  });
+  let data;
+  try {
+    data = await playFabServerRequest("/Server/AuthenticateSessionTicket", {
+      SessionTicket: ticket
+    });
+  } catch (error) {
+    error.status = 401;
+    throw error;
+  }
 
   const playFabId = sanitizePlayFabId(data?.UserInfo?.PlayFabId ?? data?.PlayFabId);
   if (!playFabId) {
