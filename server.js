@@ -8,8 +8,24 @@ app.use(cors());
 app.use(express.json());
 
 const rooms = new Map();
+const arcadeRuns = new Map();
+const processedTournamentMatches = new Map();
 const HEARTBEAT_TIMEOUT_MS = 60 * 1000;
 const SESSION_TIMEOUT_MS = 2 * 60 * 1000;
+const PLAYFAB_TITLE_ID = (process.env.PLAYFAB_TITLE_ID ?? "").trim();
+const PLAYFAB_SECRET_KEY = (process.env.PLAYFAB_SECRET_KEY ?? "").trim();
+const PLAYFAB_API_BASE = PLAYFAB_TITLE_ID ? `https://${PLAYFAB_TITLE_ID}.playfabapi.com` : "";
+const ARCADE_RUN_TTL_MS = Math.max(60_000, Number.parseInt(process.env.ARCADE_RUN_TTL_SECONDS ?? "1800", 10) * 1000 || 1_800_000);
+const ARCADE_SUBMIT_MIN_INTERVAL_MS = Math.max(250, Number.parseInt(process.env.ARCADE_SUBMIT_MIN_INTERVAL_MS ?? "1200", 10) || 1200);
+const ARCADE_MAX_DISTANCE_PER_SECOND = Math.max(5, Number.parseFloat(process.env.ARCADE_MAX_DISTANCE_PER_SECOND ?? "35") || 35);
+const ARCADE_DISTANCE_GRACE = Math.max(0, Number.parseInt(process.env.ARCADE_DISTANCE_GRACE ?? "250", 10) || 250);
+const ARCADE_ABSOLUTE_SCORE_CAP = Math.max(1000, Number.parseInt(process.env.ARCADE_ABSOLUTE_SCORE_CAP ?? "1000000", 10) || 1_000_000);
+const TOURNAMENT_CROWN_REWARDS = new Map([
+  [1, Math.max(0, Number.parseInt(process.env.TOURNAMENT_CROWNS_FIRST ?? "3", 10) || 3)],
+  [2, Math.max(0, Number.parseInt(process.env.TOURNAMENT_CROWNS_SECOND ?? "2", 10) || 2)],
+  [3, Math.max(0, Number.parseInt(process.env.TOURNAMENT_CROWNS_THIRD ?? "1", 10) || 1)]
+]);
+const TOURNAMENT_MATCH_TTL_MS = Math.max(60_000, Number.parseInt(process.env.TOURNAMENT_MATCH_RECEIPT_TTL_SECONDS ?? "86400", 10) * 1000 || 86_400_000);
 const EDGEGAP_LOBBY_URL = (process.env.EDGEGAP_LOBBY_URL ?? "").trim();
 const RELAY_REGION = (process.env.UNITY_RELAY_REGION ?? process.env.EDGEGAP_REGION ?? "").trim() || null;
 const UNITY_RELAY_REGION_AUTO_GEO = isTruthy(process.env.UNITY_RELAY_REGION_AUTO_GEO);
@@ -260,6 +276,148 @@ function createSessionId() {
   return crypto.randomBytes(16).toString("hex");
 }
 
+function createReceiptId(prefix) {
+  return `${prefix}-${Date.now().toString(36)}-${crypto.randomBytes(12).toString("hex")}`;
+}
+
+function playFabConfigured() {
+  return PLAYFAB_TITLE_ID.length > 0 && PLAYFAB_SECRET_KEY.length > 0;
+}
+
+function requirePlayFabConfigured(res) {
+  if (playFabConfigured())
+    return true;
+
+  res.status(503).json({
+    ok: false,
+    error: "PlayFab server credentials are not configured. Set PLAYFAB_TITLE_ID and PLAYFAB_SECRET_KEY on the backend."
+  });
+  return false;
+}
+
+function parseNonNegativeInteger(value, fallback = 0) {
+  const parsed = typeof value === "number" ? Math.floor(value) : Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed < 0)
+    return fallback;
+  return parsed;
+}
+
+function parseNonNegativeNumber(value, fallback = 0) {
+  const parsed = typeof value === "number" ? value : Number.parseFloat(value);
+  if (!Number.isFinite(parsed) || parsed < 0)
+    return fallback;
+  return parsed;
+}
+
+function sanitizePlayFabId(value) {
+  const text = String(value ?? "").trim();
+  if (!text || text.length > 64)
+    return "";
+  return text;
+}
+
+function sanitizeDisplayName(value) {
+  const text = String(value ?? "").trim();
+  return text.length > 40 ? text.slice(0, 40) : text;
+}
+
+async function playFabServerRequest(path, body) {
+  const response = await fetch(`${PLAYFAB_API_BASE}${path}`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-secretkey": PLAYFAB_SECRET_KEY
+    },
+    body: JSON.stringify(body ?? {})
+  });
+
+  const text = await response.text();
+  let parsed = null;
+  if (text) {
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      parsed = { raw: text };
+    }
+  }
+
+  if (!response.ok || parsed?.code === 400 || parsed?.error) {
+    const message = parsed?.errorMessage ?? parsed?.error ?? `PlayFab request failed with HTTP ${response.status}`;
+    const error = new Error(message);
+    error.status = response.status;
+    error.playFab = parsed;
+    throw error;
+  }
+
+  return parsed?.data ?? parsed ?? {};
+}
+
+async function authenticateSessionTicket(sessionTicket) {
+  const ticket = String(sessionTicket ?? "").trim();
+  if (!ticket) {
+    const error = new Error("sessionTicket is required");
+    error.status = 401;
+    throw error;
+  }
+
+  const data = await playFabServerRequest("/Server/AuthenticateSessionTicket", {
+    SessionTicket: ticket
+  });
+
+  const playFabId = sanitizePlayFabId(data?.UserInfo?.PlayFabId ?? data?.PlayFabId);
+  if (!playFabId) {
+    const error = new Error("PlayFab session ticket did not resolve to a player");
+    error.status = 401;
+    throw error;
+  }
+
+  return playFabId;
+}
+
+async function getPlayerStatistic(playFabId, statisticName) {
+  const data = await playFabServerRequest("/Server/GetPlayerStatistics", {
+    PlayFabId: playFabId,
+    StatisticNames: [statisticName]
+  });
+
+  const stats = Array.isArray(data?.Statistics) ? data.Statistics : [];
+  const match = stats.find(stat => stat?.StatisticName === statisticName);
+  return parseNonNegativeInteger(match?.Value, 0);
+}
+
+async function updatePlayerStatistic(playFabId, statisticName, value) {
+  await playFabServerRequest("/Server/UpdatePlayerStatistics", {
+    PlayFabId: playFabId,
+    Statistics: [
+      {
+        StatisticName: statisticName,
+        Value: parseNonNegativeInteger(value, 0)
+      }
+    ]
+  });
+}
+
+function pruneLeaderboardReceipts() {
+  const now = Date.now();
+  for (const [runId, run] of arcadeRuns) {
+    if (!run || now - run.startedAt > ARCADE_RUN_TTL_MS)
+      arcadeRuns.delete(runId);
+  }
+
+  for (const [matchId, receipt] of processedTournamentMatches) {
+    if (!receipt || now - receipt.createdAt > TOURNAMENT_MATCH_TTL_MS)
+      processedTournamentMatches.delete(matchId);
+  }
+}
+
+function isArcadeScorePlausible(run, score, elapsedSeconds) {
+  const wallElapsed = Math.max(0, (Date.now() - run.startedAt) / 1000);
+  const clientElapsed = parseNonNegativeNumber(elapsedSeconds, 0);
+  const effectiveElapsed = Math.max(wallElapsed, clientElapsed);
+  const maxAllowed = Math.floor(Math.max(ARCADE_DISTANCE_GRACE, effectiveElapsed * ARCADE_MAX_DISTANCE_PER_SECOND + ARCADE_DISTANCE_GRACE));
+  return score <= maxAllowed && score <= ARCADE_ABSOLUTE_SCORE_CAP;
+}
+
 function pruneSessions(room, now = Date.now()) {
   const sessions = room.joinSessions;
   if (!(sessions instanceof Map)) return;
@@ -376,7 +534,8 @@ async function buildConfigPayload(req = null) {
     relayRegionCountry: relayRegionSelection.country,
     relayRegionIpPrefix: relayRegionSelection.ipPrefix,
     unityRelayEnabled: RELAY_PROVIDER === "unity" && RELAY_ENABLED,
-    relayLobbyWaitTimeoutSeconds: RELAY_LOBBY_WAIT_TIMEOUT_SECONDS
+    relayLobbyWaitTimeoutSeconds: RELAY_LOBBY_WAIT_TIMEOUT_SECONDS,
+    playFabLeaderboardsConfigured: playFabConfigured()
   };
 }
 
@@ -401,6 +560,166 @@ app.get("/health", async (req, res) => {
 
 app.get("/config", async (req, res) => {
   return res.json(await buildConfigPayload(req));
+});
+
+app.post("/leaderboards/arcade/runs/start", async (req, res) => {
+  if (!requirePlayFabConfigured(res))
+    return;
+
+  pruneLeaderboardReceipts();
+
+  try {
+    const authenticatedPlayFabId = await authenticateSessionTicket(req.body?.sessionTicket);
+    const requestedPlayFabId = sanitizePlayFabId(req.body?.playFabId);
+    if (requestedPlayFabId && requestedPlayFabId !== authenticatedPlayFabId)
+      return res.status(403).json({ ok: false, error: "Session ticket does not match requested PlayFabId" });
+
+    const runId = createReceiptId("arcade");
+    arcadeRuns.set(runId, {
+      runId,
+      playFabId: authenticatedPlayFabId,
+      displayName: sanitizeDisplayName(req.body?.displayName),
+      startedAt: Date.now(),
+      lastSubmitAt: 0,
+      bestScore: 0,
+      ipPrefix: maskIpPrefix(getRequesterIp(req))
+    });
+
+    return res.json({ ok: true, runId });
+  } catch (error) {
+    const status = error.status === 401 ? 401 : 500;
+    console.warn(`[leaderboards] Arcade run start failed: ${error.message}`);
+    return res.status(status).json({ ok: false, error: status === 401 ? "Invalid PlayFab session ticket" : "Backend PlayFab authentication failed" });
+  }
+});
+
+app.post("/leaderboards/arcade/runs/finish", async (req, res) => {
+  if (!requirePlayFabConfigured(res))
+    return;
+
+  pruneLeaderboardReceipts();
+
+  try {
+    const authenticatedPlayFabId = await authenticateSessionTicket(req.body?.sessionTicket);
+    const runId = String(req.body?.runId ?? "").trim();
+    const run = arcadeRuns.get(runId);
+    if (!run)
+      return res.status(404).json({ ok: false, accepted: false, error: "Arcade run is missing or expired" });
+
+    if (run.playFabId !== authenticatedPlayFabId)
+      return res.status(403).json({ ok: false, accepted: false, error: "Session ticket does not match arcade run owner" });
+
+    const now = Date.now();
+    if (run.lastSubmitAt > 0 && now - run.lastSubmitAt < ARCADE_SUBMIT_MIN_INTERVAL_MS)
+      return res.status(429).json({ ok: false, accepted: false, error: "Arcade score submissions are too frequent" });
+
+    const score = parseNonNegativeInteger(req.body?.score, 0);
+    if (score <= run.bestScore)
+      return res.json({ ok: true, accepted: false, message: "Score was not higher than this run's accepted best" });
+
+    if (!isArcadeScorePlausible(run, score, req.body?.elapsedSeconds)) {
+      console.warn(`[leaderboards] Suspicious arcade score rejected. playFabId=${run.playFabId} score=${score} runId=${runId} ip=${run.ipPrefix ?? "unknown"}`);
+      return res.status(400).json({ ok: false, accepted: false, error: "Arcade score failed timing plausibility checks" });
+    }
+
+    run.lastSubmitAt = now;
+    const remoteBest = await getPlayerStatistic(run.playFabId, "HighScore");
+    if (score <= remoteBest) {
+      run.bestScore = Math.max(run.bestScore, score);
+      return res.json({ ok: true, accepted: false, message: "Remote HighScore is already higher or equal" });
+    }
+
+    await updatePlayerStatistic(run.playFabId, "HighScore", score);
+    run.bestScore = score;
+    arcadeRuns.set(runId, run);
+    return res.json({ ok: true, accepted: true, message: "HighScore updated" });
+  } catch (error) {
+    const status = error.status === 401 ? 401 : 500;
+    console.warn(`[leaderboards] Arcade score submit failed: ${error.message}`);
+    return res.status(status).json({ ok: false, accepted: false, error: status === 401 ? "Invalid PlayFab session ticket" : "Backend PlayFab score update failed" });
+  }
+});
+
+app.post("/leaderboards/tournament/match-results", async (req, res) => {
+  if (!requirePlayFabConfigured(res))
+    return;
+
+  pruneLeaderboardReceipts();
+
+  try {
+    const authenticatedHostPlayFabId = await authenticateSessionTicket(req.body?.sessionTicket);
+    const requestedHostPlayFabId = sanitizePlayFabId(req.body?.hostPlayFabId);
+    if (requestedHostPlayFabId && requestedHostPlayFabId !== authenticatedHostPlayFabId)
+      return res.status(403).json({ ok: false, accepted: false, error: "Session ticket does not match host PlayFabId" });
+
+    const matchId = String(req.body?.matchId ?? "").trim();
+    if (!matchId || matchId.length > 128)
+      return res.status(400).json({ ok: false, accepted: false, error: "matchId is required" });
+
+    if (processedTournamentMatches.has(matchId))
+      return res.json({ ok: true, accepted: false, message: "Duplicate match receipt ignored" });
+
+    const results = Array.isArray(req.body?.results) ? req.body.results : [];
+    if (results.length === 0 || results.length > 20)
+      return res.status(400).json({ ok: false, accepted: false, error: "results must contain 1 to 20 players" });
+
+    processedTournamentMatches.set(matchId, {
+      createdAt: Date.now(),
+      hostPlayFabId: authenticatedHostPlayFabId,
+      status: "processing"
+    });
+
+    const seenPlayers = new Set();
+    const updates = [];
+    for (const rawResult of results) {
+      const playFabId = sanitizePlayFabId(rawResult?.playFabId);
+      if (!playFabId || seenPlayers.has(playFabId))
+        continue;
+
+      seenPlayers.add(playFabId);
+      const placement = parseNonNegativeInteger(rawResult?.placement, 0);
+      const maxDelta = TOURNAMENT_CROWN_REWARDS.get(placement) ?? 0;
+      const requestedDelta = parseNonNegativeInteger(rawResult?.crownsAwarded, 0);
+      const safeDelta = Math.min(requestedDelta, maxDelta);
+      if (safeDelta <= 0)
+        continue;
+
+      const requestedTotal = parseNonNegativeInteger(rawResult?.totalLifetimeCrowns, 0);
+      const remoteTotal = await getPlayerStatistic(playFabId, "TournamentCrownsEarned");
+      const allowedTotal = Math.max(remoteTotal, Math.min(requestedTotal, remoteTotal + safeDelta));
+      if (allowedTotal <= remoteTotal)
+        continue;
+
+      await updatePlayerStatistic(playFabId, "TournamentCrownsEarned", allowedTotal);
+      updates.push({
+        playFabId,
+        placement,
+        value: allowedTotal,
+        delta: allowedTotal - remoteTotal
+      });
+    }
+
+    processedTournamentMatches.set(matchId, {
+      createdAt: Date.now(),
+      hostPlayFabId: authenticatedHostPlayFabId,
+      status: "accepted",
+      updateCount: updates.length
+    });
+
+    return res.json({
+      ok: true,
+      accepted: updates.length > 0,
+      message: updates.length > 0 ? `TournamentCrownsEarned updated for ${updates.length} player(s)` : "No higher tournament crown totals were accepted"
+    });
+  } catch (error) {
+    const matchId = String(req.body?.matchId ?? "").trim();
+    if (matchId && processedTournamentMatches.get(matchId)?.status === "processing")
+      processedTournamentMatches.delete(matchId);
+
+    const status = error.status === 401 ? 401 : 500;
+    console.warn(`[leaderboards] Tournament result submit failed: ${error.message}`);
+    return res.status(status).json({ ok: false, accepted: false, error: status === 401 ? "Invalid PlayFab session ticket" : "Backend PlayFab tournament update failed" });
+  }
 });
 
 app.post("/rooms", (req, res) => {
@@ -495,8 +814,8 @@ app.get("/rooms", (_req, res) => {
       natTraversalEnabled: Boolean(room.natTraversalEnabled),
       internetMode,
       relayProvider: room.relayProvider ?? (internetMode === "relay" ? RELAY_PROVIDER : null),
-      relayLobbyId: room.relayLobbyId ?? null,
-      relayJoinCode: room.relayJoinCode ?? (room.relayProvider === "unity" ? room.relayLobbyId ?? null : null),
+      relayLobbyId: null,
+      relayJoinCode: null,
       relayLobbyUrl: room.relayLobbyUrl ?? (internetMode === "relay" && RELAY_PROVIDER === "edgegap" ? EDGEGAP_LOBBY_URL || null : null),
       relayRegion: room.relayRegion ?? RELAY_REGION,
       relayReady: Boolean(room.relayReady)
