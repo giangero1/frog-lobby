@@ -1,6 +1,12 @@
 import express from "express";
 import cors from "cors";
 import crypto from "crypto";
+import {
+  registerItchOwnershipRoutes,
+  requireFrogSession,
+  configPayloadFields as itchConfigPayloadFields,
+  configSummaryForLog as itchConfigSummaryForLog
+} from "./frogWarsSession.js";
 
 const app = express();
 app.set("trust proxy", true);
@@ -541,7 +547,8 @@ async function buildConfigPayload(req = null) {
     relayRegionIpPrefix: relayRegionSelection.ipPrefix,
     unityRelayEnabled: RELAY_PROVIDER === "unity" && RELAY_ENABLED,
     relayLobbyWaitTimeoutSeconds: RELAY_LOBBY_WAIT_TIMEOUT_SECONDS,
-    playFabLeaderboardsConfigured: playFabConfigured()
+    playFabLeaderboardsConfigured: playFabConfigured(),
+    ...itchConfigPayloadFields()
   };
 }
 
@@ -566,6 +573,24 @@ app.get("/health", async (req, res) => {
 
 app.get("/config", async (req, res) => {
   return res.json(await buildConfigPayload(req));
+});
+
+// itch.io ownership verification + Frog Wars session token endpoints.
+// linkAccount persists the itch<->PlayFab mapping into PlayFab user data when
+// both PlayFab is configured and a playFabId is supplied (best-effort, non-fatal).
+registerItchOwnershipRoutes(app, {
+  linkAccount: async (itchUserId, itchUsername, playFabId) => {
+    if (!playFabConfigured() || !playFabId)
+      return;
+    await playFabServerRequest("/Server/UpdateUserReadOnlyData", {
+      PlayFabId: playFabId,
+      Data: {
+        ItchUserId: String(itchUserId ?? ""),
+        ItchUsername: String(itchUsername ?? ""),
+        ItchLinkedAtUnixMs: String(Date.now())
+      }
+    });
+  }
 });
 
 app.post("/leaderboards/arcade/runs/start", async (req, res) => {
@@ -601,6 +626,10 @@ app.post("/leaderboards/arcade/runs/start", async (req, res) => {
 
 app.post("/leaderboards/arcade/runs/finish", async (req, res) => {
   if (!requirePlayFabConfigured(res))
+    return;
+
+  // Ownership gate (arcade scores are owner-only by design). No-op when not enforced.
+  if (!requireFrogSession(req, res))
     return;
 
   pruneLeaderboardReceipts();
@@ -648,6 +677,10 @@ app.post("/leaderboards/arcade/runs/finish", async (req, res) => {
 
 app.post("/leaderboards/tournament/match-results", async (req, res) => {
   if (!requirePlayFabConfigured(res))
+    return;
+
+  // Ownership gate (host must be a verified owner). No-op when not enforced.
+  if (!requireFrogSession(req, res))
     return;
 
   pruneLeaderboardReceipts();
@@ -729,6 +762,11 @@ app.post("/leaderboards/tournament/match-results", async (req, res) => {
 });
 
 app.post("/rooms", (req, res) => {
+  // Ownership gate: publishing an official online room requires a verified token
+  // when enforcement is active. No-op when ownership is not configured/enabled.
+  if (!requireFrogSession(req, res))
+    return;
+
   const {
     roomId,
     roomName,
@@ -1041,4 +1079,7 @@ app.delete("/rooms/:roomId", (req, res) => {
 });
 
 const port = process.env.PORT || 7070;
-app.listen(port, () => console.log(`Lobby server listening on ${port}`));
+app.listen(port, () => {
+  console.log(`Lobby server listening on ${port}`);
+  console.log(`[startup] ${itchConfigSummaryForLog()}`);
+});
