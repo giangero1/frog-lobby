@@ -1,4 +1,4 @@
-export const SHOP_SLOTS = new Set(["hat", "shirt", "pants", "shoes"]);
+export const SHOP_SLOTS = new Set(["hat", "shirt", "pants", "shoes", "miscellaneous"]);
 
 export function purchaseDecision(balance, price, alreadyOwned) {
   if (alreadyOwned) return { ok: true, alreadyOwned: true };
@@ -13,6 +13,14 @@ export function validateEquipSelection(slot, itemId, definition, owned) {
   if (!definition || definition.slot !== slot) return { ok: false, error: "wrong-slot" };
   if (!owned.includes(itemId)) return { ok: false, error: "not-owned" };
   return { ok: true };
+}
+
+export function updateMiscellaneousSelection(current, itemId, equipped, limit = 16) {
+  const items = new Set(Array.isArray(current) ? current.map(x => String(x).trim()).filter(Boolean) : []);
+  if (!itemId) items.clear();
+  else if (equipped) items.add(itemId);
+  else items.delete(itemId);
+  return [...items].slice(0, limit);
 }
 
 export function normalizeCatalogItem(raw, currencyCode) {

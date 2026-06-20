@@ -1,7 +1,7 @@
 import express from "express";
 import cors from "cors";
 import crypto from "crypto";
-import { normalizeCatalogItem, purchaseDecision, SHOP_SLOTS, validateEquipSelection } from "./shopLogic.js";
+import { normalizeCatalogItem, purchaseDecision, SHOP_SLOTS, updateMiscellaneousSelection, validateEquipSelection } from "./shopLogic.js";
 import {
   registerItchOwnershipRoutes,
   requireFrogSession,
@@ -30,7 +30,8 @@ const SHOP_ITEMS = new Map([
   ["america-first-hat", { displayName: "America First Hat", slot: "hat", price: 5 }],
   ["shtreimel", { displayName: "Shtreimel", slot: "hat", price: 8 }],
   ["crusader-helmet", { displayName: "Crusader Helmet", slot: "hat", price: 12 }],
-  ["king-crown", { displayName: "King Crown", slot: "hat", price: 20 }]
+  ["king-crown", { displayName: "King Crown", slot: "hat", price: 20 }],
+  ["charlie-chaplin-mustache", { displayName: "Charlie Chaplin Mustache", slot: "miscellaneous", price: 16 }]
 ]);
 let shopCatalogLastRefresh = 0;
 const ARCADE_RUN_TTL_MS = Math.max(60_000, Number.parseInt(process.env.ARCADE_RUN_TTL_SECONDS ?? "1800", 10) * 1000 || 1_800_000);
@@ -473,15 +474,19 @@ async function refreshShopCatalog(force = false) {
 async function getShopLoadout(playFabId) {
   const data = await playFabServerRequest("/Server/GetUserReadOnlyData", {
     PlayFabId: playFabId,
-    Keys: ["CosmeticHat", "CosmeticShirt", "CosmeticPants", "CosmeticShoes", "CosmeticRevision"]
+    Keys: ["CosmeticHat", "CosmeticShirt", "CosmeticPants", "CosmeticShoes", "CosmeticMiscellaneous", "CosmeticRevision"]
   });
   const values = data?.Data ?? {};
   const value = key => String(values?.[key]?.Value ?? "").trim();
+  let miscellaneous = [];
+  try { miscellaneous = JSON.parse(value("CosmeticMiscellaneous") || "[]"); } catch { miscellaneous = []; }
+  if (!Array.isArray(miscellaneous)) miscellaneous = [];
   return {
     hat: value("CosmeticHat"),
     shirt: value("CosmeticShirt"),
     pants: value("CosmeticPants"),
     shoes: value("CosmeticShoes"),
+    miscellaneous: [...new Set(miscellaneous.map(x => String(x).trim()).filter(Boolean))].slice(0, 16),
     revision: parseNonNegativeInteger(value("CosmeticRevision"), 0)
   };
 }
@@ -495,6 +500,7 @@ async function saveShopLoadout(playFabId, loadout) {
       CosmeticShirt: String(loadout?.shirt ?? ""),
       CosmeticPants: String(loadout?.pants ?? ""),
       CosmeticShoes: String(loadout?.shoes ?? ""),
+      CosmeticMiscellaneous: JSON.stringify(Array.isArray(loadout?.miscellaneous) ? loadout.miscellaneous.slice(0, 16) : []),
       CosmeticRevision: String(revision)
     }
   });
@@ -511,9 +517,10 @@ function shopResponse(playFabId, inventory, loadout, message) {
     shirt: loadout.shirt || "",
     pants: loadout.pants || "",
     shoes: loadout.shoes || "",
+    miscellaneous: Array.isArray(loadout.miscellaneous) ? loadout.miscellaneous : [],
     rev: loadout.revision || 0
   }).token;
-  return { ok: true, message, crowns: inventory.crowns, owned: inventory.owned, hat: loadout.hat || "", shirt: loadout.shirt || "", pants: loadout.pants || "", shoes: loadout.shoes || "", revision: loadout.revision || 0, receipt };
+  return { ok: true, message, crowns: inventory.crowns, owned: inventory.owned, hat: loadout.hat || "", shirt: loadout.shirt || "", pants: loadout.pants || "", shoes: loadout.shoes || "", miscellaneous: Array.isArray(loadout.miscellaneous) ? loadout.miscellaneous : [], revision: loadout.revision || 0, receipt };
 }
 
 async function authenticateShopRequest(req, res) {
@@ -949,9 +956,15 @@ app.post("/shop/equip", async (req, res) => {
     const selection = validateEquipSelection(slot, itemId, SHOP_ITEMS.get(itemId), inventory.owned);
     if (!selection.ok) return res.status(selection.error === "not-owned" ? 403 : 400).json({ ok: false, error: selection.error === "not-owned" ? "Purchase this cosmetic before equipping it." : "That item does not fit this slot." });
     const loadout = await getShopLoadout(playFabId);
-    loadout[slot] = itemId;
+    if (slot === "miscellaneous") {
+      const equipped = req.body?.equipped !== false;
+      loadout.miscellaneous = updateMiscellaneousSelection(loadout.miscellaneous, itemId, equipped);
+    } else loadout[slot] = itemId;
     const saved = await saveShopLoadout(playFabId, loadout);
-    return res.json(shopResponse(playFabId, inventory, saved, itemId ? "Cosmetic equipped." : "Slot cleared."));
+    const message = slot === "miscellaneous" && itemId && req.body?.equipped === false
+      ? "Cosmetic unequipped."
+      : itemId ? "Cosmetic equipped." : "Slot cleared.";
+    return res.json(shopResponse(playFabId, inventory, saved, message));
   } catch (error) {
     const status = error.status === 401 ? 401 : 500;
     console.warn(`[shop] Equip failed: ${error.message}`);
