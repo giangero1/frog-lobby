@@ -188,6 +188,21 @@ export function mintSessionToken({ itchUserId, playFabId, ownershipVerified = tr
   return { token, payload, expiresAtUnixMs: payload.exp * 1000 };
 }
 
+export function mintSignedPayload(fields, ttlSeconds = 86400) {
+  if (!privateKeyObj) throw new Error("Signing key not configured");
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const header = { alg: "RS256", typ: "JWT" };
+  const payload = {
+    v: TOKEN_VERSION,
+    ...(fields ?? {}),
+    iat: nowSeconds,
+    exp: nowSeconds + Math.max(60, Number.parseInt(ttlSeconds, 10) || 86400)
+  };
+  const signingInput = `${base64UrlEncode(JSON.stringify(header))}.${base64UrlEncode(JSON.stringify(payload))}`;
+  const signature = crypto.sign("RSA-SHA256", Buffer.from(signingInput, "utf8"), privateKeyObj);
+  return { token: `${signingInput}.${base64UrlEncode(signature)}`, payload, expiresAtUnixMs: payload.exp * 1000 };
+}
+
 // Returns { valid, payload, reason }.
 export function verifySessionToken(token) {
   if (!privateKeyObj || !publicKeyPem)

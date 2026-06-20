@@ -1,9 +1,11 @@
 import express from "express";
 import cors from "cors";
 import crypto from "crypto";
+import { normalizeCatalogItem, purchaseDecision, SHOP_SLOTS, validateEquipSelection } from "./shopLogic.js";
 import {
   registerItchOwnershipRoutes,
   requireFrogSession,
+  mintSignedPayload,
   configPayloadFields as itchConfigPayloadFields,
   configSummaryForLog as itchConfigSummaryForLog
 } from "./frogWarsSession.js";
@@ -21,6 +23,16 @@ const SESSION_TIMEOUT_MS = 2 * 60 * 1000;
 const PLAYFAB_TITLE_ID = (process.env.PLAYFAB_TITLE_ID ?? "").trim();
 const PLAYFAB_SECRET_KEY = (process.env.PLAYFAB_SECRET_KEY ?? "").trim();
 const PLAYFAB_API_BASE = PLAYFAB_TITLE_ID ? `https://${PLAYFAB_TITLE_ID}.playfabapi.com` : "";
+const SHOP_CURRENCY_CODE = (process.env.SHOP_CURRENCY_CODE ?? "CR").trim().toUpperCase();
+const SHOP_CATALOG_VERSION = (process.env.SHOP_CATALOG_VERSION ?? "Cosmetics").trim();
+const SHOP_ADMIN_TOKEN = (process.env.SHOP_ADMIN_TOKEN ?? "").trim();
+const SHOP_ITEMS = new Map([
+  ["america-first-hat", { displayName: "America First Hat", slot: "hat", price: 5 }],
+  ["shtreimel", { displayName: "Shtreimel", slot: "hat", price: 8 }],
+  ["crusader-helmet", { displayName: "Crusader Helmet", slot: "hat", price: 12 }],
+  ["king-crown", { displayName: "King Crown", slot: "hat", price: 20 }]
+]);
+let shopCatalogLastRefresh = 0;
 const ARCADE_RUN_TTL_MS = Math.max(60_000, Number.parseInt(process.env.ARCADE_RUN_TTL_SECONDS ?? "1800", 10) * 1000 || 1_800_000);
 const ARCADE_SUBMIT_MIN_INTERVAL_MS = Math.max(250, Number.parseInt(process.env.ARCADE_SUBMIT_MIN_INTERVAL_MS ?? "1200", 10) || 1200);
 const ARCADE_MAX_DISTANCE_PER_SECOND = Math.max(5, Number.parseFloat(process.env.ARCADE_MAX_DISTANCE_PER_SECOND ?? "35") || 35);
@@ -409,6 +421,118 @@ async function updatePlayerStatistic(playFabId, statisticName, value) {
   });
 }
 
+async function addShopCrowns(playFabId, amount) {
+  const delta = Math.max(0, parseNonNegativeInteger(amount, 0));
+  if (delta <= 0) return;
+  await playFabServerRequest("/Server/AddUserVirtualCurrency", {
+    PlayFabId: playFabId,
+    VirtualCurrency: SHOP_CURRENCY_CODE,
+    Amount: delta
+  });
+}
+
+async function subtractShopCrowns(playFabId, amount) {
+  const delta = Math.max(0, parseNonNegativeInteger(amount, 0));
+  if (delta <= 0) return;
+  await playFabServerRequest("/Server/SubtractUserVirtualCurrency", {
+    PlayFabId: playFabId,
+    VirtualCurrency: SHOP_CURRENCY_CODE,
+    Amount: delta
+  });
+}
+
+async function getShopInventory(playFabId) {
+  await refreshShopCatalog();
+  const data = await playFabServerRequest("/Server/GetUserInventory", { PlayFabId: playFabId });
+  const inventory = Array.isArray(data?.Inventory) ? data.Inventory : [];
+  return {
+    crowns: parseNonNegativeInteger(data?.VirtualCurrency?.[SHOP_CURRENCY_CODE], 0),
+    owned: [...new Set(inventory.map(entry => String(entry?.ItemId ?? "").trim()).filter(id => SHOP_ITEMS.has(id)))]
+  };
+}
+
+async function refreshShopCatalog(force = false) {
+  if (!force && Date.now() - shopCatalogLastRefresh < 60_000) return SHOP_ITEMS;
+  const data = await playFabServerRequest("/Server/GetCatalogItems", { CatalogVersion: SHOP_CATALOG_VERSION });
+  const entries = Array.isArray(data?.Catalog) ? data.Catalog : [];
+  if (entries.length > 0) {
+    SHOP_ITEMS.clear();
+    for (const entry of entries) {
+      const itemId = String(entry?.ItemId ?? "").trim();
+      let custom = {};
+      try { custom = JSON.parse(entry?.CustomData ?? "{}"); } catch { custom = {}; }
+      const slot = String(custom?.slot ?? "hat").trim().toLowerCase();
+      const rawPrice = entry?.VirtualCurrencyPrices?.[SHOP_CURRENCY_CODE];
+      if (itemId && SHOP_SLOTS.has(slot)) SHOP_ITEMS.set(itemId, { displayName: String(entry?.DisplayName ?? itemId), slot, price: parseNonNegativeInteger(rawPrice, 0) });
+    }
+  }
+  shopCatalogLastRefresh = Date.now();
+  return SHOP_ITEMS;
+}
+
+async function getShopLoadout(playFabId) {
+  const data = await playFabServerRequest("/Server/GetUserReadOnlyData", {
+    PlayFabId: playFabId,
+    Keys: ["CosmeticHat", "CosmeticShirt", "CosmeticPants", "CosmeticShoes", "CosmeticRevision"]
+  });
+  const values = data?.Data ?? {};
+  const value = key => String(values?.[key]?.Value ?? "").trim();
+  return {
+    hat: value("CosmeticHat"),
+    shirt: value("CosmeticShirt"),
+    pants: value("CosmeticPants"),
+    shoes: value("CosmeticShoes"),
+    revision: parseNonNegativeInteger(value("CosmeticRevision"), 0)
+  };
+}
+
+async function saveShopLoadout(playFabId, loadout) {
+  const revision = Math.max(Date.now(), parseNonNegativeInteger(loadout?.revision, 0) + 1);
+  await playFabServerRequest("/Server/UpdateUserReadOnlyData", {
+    PlayFabId: playFabId,
+    Data: {
+      CosmeticHat: String(loadout?.hat ?? ""),
+      CosmeticShirt: String(loadout?.shirt ?? ""),
+      CosmeticPants: String(loadout?.pants ?? ""),
+      CosmeticShoes: String(loadout?.shoes ?? ""),
+      CosmeticRevision: String(revision)
+    }
+  });
+  return { ...loadout, revision };
+}
+
+function shopResponse(playFabId, inventory, loadout, message) {
+  const receipt = mintSignedPayload({
+    typ: "shop",
+    pf: playFabId,
+    crowns: inventory.crowns,
+    owned: inventory.owned,
+    hat: loadout.hat || "",
+    shirt: loadout.shirt || "",
+    pants: loadout.pants || "",
+    shoes: loadout.shoes || "",
+    rev: loadout.revision || 0
+  }).token;
+  return { ok: true, message, crowns: inventory.crowns, owned: inventory.owned, hat: loadout.hat || "", shirt: loadout.shirt || "", pants: loadout.pants || "", shoes: loadout.shoes || "", revision: loadout.revision || 0, receipt };
+}
+
+async function authenticateShopRequest(req, res) {
+  const frogSession = requireFrogSession(req, res);
+  if (!frogSession) return null;
+  const playFabId = await authenticateSessionTicket(req.body?.sessionTicket);
+  const requested = sanitizePlayFabId(req.body?.playFabId);
+  if (requested && requested !== playFabId) {
+    res.status(403).json({ ok: false, error: "Session ticket does not match requested PlayFabId" });
+    return null;
+  }
+  const tokenPlayFabId = sanitizePlayFabId(frogSession?.payload?.pf);
+  if (tokenPlayFabId && tokenPlayFabId !== playFabId) {
+    res.status(403).json({ ok: false, error: "Frog Wars session does not match the PlayFab account" });
+    return null;
+  }
+  return playFabId;
+}
+
 function pruneLeaderboardReceipts() {
   const now = Date.now();
   for (const [runId, run] of arcadeRuns) {
@@ -729,12 +853,18 @@ app.post("/leaderboards/tournament/match-results", async (req, res) => {
       if (allowedTotal <= remoteTotal)
         continue;
 
-      await updatePlayerStatistic(playFabId, "TournamentCrownsEarned", allowedTotal);
+      const awardedDelta = allowedTotal - remoteTotal;
+      await addShopCrowns(playFabId, awardedDelta);
+      try {
+        await updatePlayerStatistic(playFabId, "TournamentCrownsEarned", allowedTotal);
+      } catch (statError) {
+        console.warn(`[leaderboards] Currency awarded but lifetime statistic update failed for ${playFabId}: ${statError.message}`);
+      }
       updates.push({
         playFabId,
         placement,
         value: allowedTotal,
-        delta: allowedTotal - remoteTotal
+        delta: awardedDelta
       });
     }
 
@@ -758,6 +888,115 @@ app.post("/leaderboards/tournament/match-results", async (req, res) => {
     const status = error.status === 401 ? 401 : 500;
     console.warn(`[leaderboards] Tournament result submit failed: ${error.message}`);
     return res.status(status).json({ ok: false, accepted: false, error: status === 401 ? "Invalid PlayFab session ticket" : "Backend PlayFab tournament update failed" });
+  }
+});
+
+app.post("/shop/profile", async (req, res) => {
+  if (!requirePlayFabConfigured(res)) return;
+  try {
+    const playFabId = await authenticateShopRequest(req, res);
+    if (!playFabId) return;
+    const [inventory, loadout] = await Promise.all([getShopInventory(playFabId), getShopLoadout(playFabId)]);
+    return res.json(shopResponse(playFabId, inventory, loadout, "Wardrobe loaded."));
+  } catch (error) {
+    const status = error.status === 401 ? 401 : 500;
+    console.warn(`[shop] Profile failed: ${error.message}`);
+    return res.status(status).json({ ok: false, error: status === 401 ? "Invalid PlayFab session ticket" : "Could not load the crown shop profile" });
+  }
+});
+
+app.post("/shop/purchase", async (req, res) => {
+  if (!requirePlayFabConfigured(res)) return;
+  try {
+    const playFabId = await authenticateShopRequest(req, res);
+    if (!playFabId) return;
+    await refreshShopCatalog();
+    const itemId = String(req.body?.itemId ?? "").trim();
+    const definition = SHOP_ITEMS.get(itemId);
+    if (!definition) return res.status(404).json({ ok: false, error: "That cosmetic is not available." });
+    const before = await getShopInventory(playFabId);
+    const decision = purchaseDecision(before.crowns, definition.price, before.owned.includes(itemId));
+    if (decision.alreadyOwned) {
+      const loadout = await getShopLoadout(playFabId);
+      return res.json(shopResponse(playFabId, before, loadout, "You already own this cosmetic."));
+    }
+    if (!decision.ok) return res.status(409).json({ ok: false, error: "Not enough crowns." });
+
+    await playFabServerRequest("/Server/PurchaseItem", {
+      PlayFabId: playFabId,
+      CatalogVersion: SHOP_CATALOG_VERSION,
+      ItemId: itemId,
+      Price: definition.price,
+      VirtualCurrency: SHOP_CURRENCY_CODE
+    });
+    const [inventory, loadout] = await Promise.all([getShopInventory(playFabId), getShopLoadout(playFabId)]);
+    return res.json(shopResponse(playFabId, inventory, loadout, `${definition.displayName} purchased.`));
+  } catch (error) {
+    const status = error.status === 401 ? 401 : 409;
+    console.warn(`[shop] Purchase failed: ${error.message}`);
+    return res.status(status).json({ ok: false, error: status === 401 ? "Invalid PlayFab session ticket" : "Purchase was declined by the crown vault." });
+  }
+});
+
+app.post("/shop/equip", async (req, res) => {
+  if (!requirePlayFabConfigured(res)) return;
+  try {
+    const playFabId = await authenticateShopRequest(req, res);
+    if (!playFabId) return;
+    const slot = String(req.body?.slot ?? "").trim().toLowerCase();
+    const itemId = String(req.body?.itemId ?? "").trim();
+    const inventory = await getShopInventory(playFabId);
+    const selection = validateEquipSelection(slot, itemId, SHOP_ITEMS.get(itemId), inventory.owned);
+    if (!selection.ok) return res.status(selection.error === "not-owned" ? 403 : 400).json({ ok: false, error: selection.error === "not-owned" ? "Purchase this cosmetic before equipping it." : "That item does not fit this slot." });
+    const loadout = await getShopLoadout(playFabId);
+    loadout[slot] = itemId;
+    const saved = await saveShopLoadout(playFabId, loadout);
+    return res.json(shopResponse(playFabId, inventory, saved, itemId ? "Cosmetic equipped." : "Slot cleared."));
+  } catch (error) {
+    const status = error.status === 401 ? 401 : 500;
+    console.warn(`[shop] Equip failed: ${error.message}`);
+    return res.status(status).json({ ok: false, error: status === 401 ? "Invalid PlayFab session ticket" : "Could not update the wardrobe." });
+  }
+});
+
+app.post("/shop/spend", async (req, res) => {
+  if (!requirePlayFabConfigured(res)) return;
+  try {
+    const playFabId = await authenticateShopRequest(req, res);
+    if (!playFabId) return;
+    const reason = String(req.body?.reason ?? "").trim();
+    const amount = parseNonNegativeInteger(req.body?.amount, 0);
+    if (reason !== "arcade-continue" || amount !== 1) return res.status(400).json({ ok: false, error: "Unsupported crown spend." });
+    const before = await getShopInventory(playFabId);
+    if (before.crowns < amount) return res.status(409).json({ ok: false, error: "Not enough crowns." });
+    await subtractShopCrowns(playFabId, amount);
+    const [inventory, loadout] = await Promise.all([getShopInventory(playFabId), getShopLoadout(playFabId)]);
+    return res.json(shopResponse(playFabId, inventory, loadout, "Crown spent."));
+  } catch (error) {
+    const status = error.status === 401 ? 401 : 409;
+    return res.status(status).json({ ok: false, error: status === 401 ? "Invalid PlayFab session ticket" : "Crown spend was declined." });
+  }
+});
+
+app.post("/shop/admin/catalog", async (req, res) => {
+  if (!requirePlayFabConfigured(res)) return;
+  const provided = String(req.get("x-shop-admin-token") ?? "");
+  if (!SHOP_ADMIN_TOKEN || provided.length !== SHOP_ADMIN_TOKEN.length || !crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(SHOP_ADMIN_TOKEN)))
+    return res.status(403).json({ ok: false, error: "Invalid shop administrator token." });
+  try {
+    const incoming = Array.isArray(req.body?.items) ? req.body.items : [];
+    const catalog = incoming.map(raw => normalizeCatalogItem(raw, SHOP_CURRENCY_CODE));
+    await playFabServerRequest("/Admin/UpdateCatalogItems", { CatalogVersion: SHOP_CATALOG_VERSION, Catalog: catalog, SetAsDefaultCatalog: false });
+    SHOP_ITEMS.clear();
+    for (const item of catalog) {
+      const custom = JSON.parse(item.CustomData);
+      SHOP_ITEMS.set(item.ItemId, { displayName: item.DisplayName, slot: custom.slot, price: item.VirtualCurrencyPrices[SHOP_CURRENCY_CODE] });
+    }
+    shopCatalogLastRefresh = Date.now();
+    return res.json({ ok: true, message: `Published ${catalog.length} cosmetics to PlayFab catalog ${SHOP_CATALOG_VERSION}.` });
+  } catch (error) {
+    console.warn(`[shop] Catalog publish failed: ${error.message}`);
+    return res.status(400).json({ ok: false, error: error.message });
   }
 });
 
