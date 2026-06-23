@@ -1,7 +1,7 @@
 import express from "express";
 import cors from "cors";
 import crypto from "crypto";
-import { normalizeCatalogItem, purchaseDecision, SHOP_SLOTS, updateMiscellaneousSelection, validateEquipSelection } from "./shopLogic.js";
+import { normalizeCatalogItem, normalizeHexColor, purchaseDecision, SHOP_SLOTS, updateMiscellaneousSelection, validateEquipSelection } from "./shopLogic.js";
 import {
   registerItchOwnershipRoutes,
   requireFrogSession,
@@ -474,7 +474,7 @@ async function refreshShopCatalog(force = false) {
 async function getShopLoadout(playFabId) {
   const data = await playFabServerRequest("/Server/GetUserReadOnlyData", {
     PlayFabId: playFabId,
-    Keys: ["CosmeticHat", "CosmeticShirt", "CosmeticPants", "CosmeticShoes", "CosmeticHair", "CosmeticMiscellaneous", "CosmeticRevision"]
+    Keys: ["CosmeticHat", "CosmeticShirt", "CosmeticPants", "CosmeticShoes", "CosmeticHair", "CosmeticHairColor", "CosmeticMiscellaneous", "CosmeticRevision"]
   });
   const values = data?.Data ?? {};
   const value = key => String(values?.[key]?.Value ?? "").trim();
@@ -487,6 +487,7 @@ async function getShopLoadout(playFabId) {
     pants: value("CosmeticPants"),
     shoes: value("CosmeticShoes"),
     hair: value("CosmeticHair"),
+    hairColor: value("CosmeticHairColor"),
     miscellaneous: [...new Set(miscellaneous.map(x => String(x).trim()).filter(Boolean))].slice(0, 16),
     revision: parseNonNegativeInteger(value("CosmeticRevision"), 0)
   };
@@ -502,6 +503,7 @@ async function saveShopLoadout(playFabId, loadout) {
       CosmeticPants: String(loadout?.pants ?? ""),
       CosmeticShoes: String(loadout?.shoes ?? ""),
       CosmeticHair: String(loadout?.hair ?? ""),
+      CosmeticHairColor: String(loadout?.hairColor ?? ""),
       CosmeticMiscellaneous: JSON.stringify(Array.isArray(loadout?.miscellaneous) ? loadout.miscellaneous.slice(0, 16) : []),
       CosmeticRevision: String(revision)
     }
@@ -520,10 +522,11 @@ function shopResponse(playFabId, inventory, loadout, message) {
     pants: loadout.pants || "",
     shoes: loadout.shoes || "",
     hair: loadout.hair || "",
+    hairColor: loadout.hairColor || "",
     miscellaneous: Array.isArray(loadout.miscellaneous) ? loadout.miscellaneous : [],
     rev: loadout.revision || 0
   }).token;
-  return { ok: true, message, crowns: inventory.crowns, owned: inventory.owned, hat: loadout.hat || "", shirt: loadout.shirt || "", pants: loadout.pants || "", shoes: loadout.shoes || "", hair: loadout.hair || "", miscellaneous: Array.isArray(loadout.miscellaneous) ? loadout.miscellaneous : [], revision: loadout.revision || 0, receipt };
+  return { ok: true, message, crowns: inventory.crowns, owned: inventory.owned, hat: loadout.hat || "", shirt: loadout.shirt || "", pants: loadout.pants || "", shoes: loadout.shoes || "", hair: loadout.hair || "", hairColor: loadout.hairColor || "", miscellaneous: Array.isArray(loadout.miscellaneous) ? loadout.miscellaneous : [], revision: loadout.revision || 0, receipt };
 }
 
 async function authenticateShopRequest(req, res) {
@@ -956,6 +959,16 @@ app.post("/shop/equip", async (req, res) => {
     const slot = String(req.body?.slot ?? "").trim().toLowerCase();
     const itemId = String(req.body?.itemId ?? "").trim();
     const inventory = await getShopInventory(playFabId);
+
+    // Hair color is a FREE preference, not a purchasable item: validate the hex and store it
+    // without ownership/slot checks.
+    if (slot === "haircolor") {
+      const loadout = await getShopLoadout(playFabId);
+      loadout.hairColor = normalizeHexColor(itemId);
+      const saved = await saveShopLoadout(playFabId, loadout);
+      return res.json(shopResponse(playFabId, inventory, saved, loadout.hairColor ? "Hair color updated." : "Hair color reset."));
+    }
+
     const selection = validateEquipSelection(slot, itemId, SHOP_ITEMS.get(itemId), inventory.owned);
     if (!selection.ok) return res.status(selection.error === "not-owned" ? 403 : 400).json({ ok: false, error: selection.error === "not-owned" ? "Purchase this cosmetic before equipping it." : "That item does not fit this slot." });
     const loadout = await getShopLoadout(playFabId);

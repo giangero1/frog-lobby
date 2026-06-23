@@ -23,6 +23,19 @@ export function updateMiscellaneousSelection(current, itemId, equipped, limit = 
   return [...items].slice(0, limit);
 }
 
+/**
+ * Normalizes a hair-color hex string to canonical 8-digit "RRGGBBAA" upper-case, or "" when
+ * empty/invalid. Accepts optional leading '#', and 6- or 8-digit hex (6 implies opaque alpha).
+ */
+export function normalizeHexColor(value) {
+  let hex = String(value ?? "").trim().replace(/^#/, "");
+  if (hex.length === 0) return "";
+  if (!/^[0-9a-fA-F]+$/.test(hex)) return "";
+  if (hex.length === 6) hex += "FF";
+  if (hex.length !== 8) return "";
+  return hex.toUpperCase();
+}
+
 export function normalizeCatalogItem(raw, currencyCode) {
   const itemId = String(raw?.itemId ?? "").trim();
   const slot = String(raw?.slot ?? "").trim().toLowerCase();

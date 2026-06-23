@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { normalizeCatalogItem, purchaseDecision, updateMiscellaneousSelection, validateEquipSelection } from "./shopLogic.js";
+import { normalizeCatalogItem, normalizeHexColor, purchaseDecision, updateMiscellaneousSelection, validateEquipSelection } from "./shopLogic.js";
 
 test("purchase rejects insufficient balance and accepts owned idempotently", () => {
   assert.equal(purchaseDecision(4, 5, false).error, "insufficient-crowns");
@@ -36,4 +36,12 @@ test("catalog publishing normalizes safe PlayFab entries", () => {
     CustomData: "{\"slot\":\"hat\"}"
   });
   assert.throws(() => normalizeCatalogItem({ itemId: "bad", slot: "weapon", price: 1 }, "CR"));
+});
+
+test("hair color normalizes to canonical RRGGBBAA or empty", () => {
+  assert.equal(normalizeHexColor("#ff8800"), "FF8800FF");
+  assert.equal(normalizeHexColor("aabbccdd"), "AABBCCDD");
+  assert.equal(normalizeHexColor(""), "");
+  assert.equal(normalizeHexColor("xyz"), "");
+  assert.equal(normalizeHexColor("12345"), "");
 });
