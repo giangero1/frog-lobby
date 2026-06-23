@@ -1,4 +1,4 @@
-export const SHOP_SLOTS = new Set(["hat", "shirt", "pants", "shoes", "miscellaneous"]);
+export const SHOP_SLOTS = new Set(["hat", "shirt", "pants", "shoes", "hair", "miscellaneous"]);
 
 export function purchaseDecision(balance, price, alreadyOwned) {
   if (alreadyOwned) return { ok: true, alreadyOwned: true };

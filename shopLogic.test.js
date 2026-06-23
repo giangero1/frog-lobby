@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { normalizeCatalogItem, purchaseDecision, validateEquipSelection } from "./shopLogic.js";
+import { normalizeCatalogItem, purchaseDecision, updateMiscellaneousSelection, validateEquipSelection } from "./shopLogic.js";
 
 test("purchase rejects insufficient balance and accepts owned idempotently", () => {
   assert.equal(purchaseDecision(4, 5, false).error, "insufficient-crowns");
@@ -13,6 +13,19 @@ test("equip requires ownership and the matching slot", () => {
   assert.equal(validateEquipSelection("hat", "king-crown", definition, []).error, "not-owned");
   assert.equal(validateEquipSelection("hat", "king-crown", definition, ["king-crown"]).ok, true);
   assert.equal(validateEquipSelection("hat", "", null, []).ok, true);
+  assert.equal(validateEquipSelection("miscellaneous", "charlie-chaplin-mustache", { slot: "miscellaneous" }, ["charlie-chaplin-mustache"]).ok, true);
+});
+
+test("catalog accepts stackable miscellaneous cosmetics", () => {
+  const item = normalizeCatalogItem({ itemId: "charlie-chaplin-mustache", displayName: "Charlie Chaplin Mustache", slot: "miscellaneous", price: 16 }, "CR");
+  assert.equal(item.CustomData, '{"slot":"miscellaneous"}');
+  assert.equal(item.VirtualCurrencyPrices.CR, 16);
+});
+
+test("miscellaneous cosmetics equip independently and can all be cleared", () => {
+  assert.deepEqual(updateMiscellaneousSelection(["glasses"], "charlie-chaplin-mustache", true), ["glasses", "charlie-chaplin-mustache"]);
+  assert.deepEqual(updateMiscellaneousSelection(["glasses", "charlie-chaplin-mustache"], "glasses", false), ["charlie-chaplin-mustache"]);
+  assert.deepEqual(updateMiscellaneousSelection(["charlie-chaplin-mustache"], "", false), []);
 });
 
 test("catalog publishing normalizes safe PlayFab entries", () => {

@@ -474,7 +474,7 @@ async function refreshShopCatalog(force = false) {
 async function getShopLoadout(playFabId) {
   const data = await playFabServerRequest("/Server/GetUserReadOnlyData", {
     PlayFabId: playFabId,
-    Keys: ["CosmeticHat", "CosmeticShirt", "CosmeticPants", "CosmeticShoes", "CosmeticMiscellaneous", "CosmeticRevision"]
+    Keys: ["CosmeticHat", "CosmeticShirt", "CosmeticPants", "CosmeticShoes", "CosmeticHair", "CosmeticMiscellaneous", "CosmeticRevision"]
   });
   const values = data?.Data ?? {};
   const value = key => String(values?.[key]?.Value ?? "").trim();
@@ -486,6 +486,7 @@ async function getShopLoadout(playFabId) {
     shirt: value("CosmeticShirt"),
     pants: value("CosmeticPants"),
     shoes: value("CosmeticShoes"),
+    hair: value("CosmeticHair"),
     miscellaneous: [...new Set(miscellaneous.map(x => String(x).trim()).filter(Boolean))].slice(0, 16),
     revision: parseNonNegativeInteger(value("CosmeticRevision"), 0)
   };
@@ -500,6 +501,7 @@ async function saveShopLoadout(playFabId, loadout) {
       CosmeticShirt: String(loadout?.shirt ?? ""),
       CosmeticPants: String(loadout?.pants ?? ""),
       CosmeticShoes: String(loadout?.shoes ?? ""),
+      CosmeticHair: String(loadout?.hair ?? ""),
       CosmeticMiscellaneous: JSON.stringify(Array.isArray(loadout?.miscellaneous) ? loadout.miscellaneous.slice(0, 16) : []),
       CosmeticRevision: String(revision)
     }
@@ -517,10 +519,11 @@ function shopResponse(playFabId, inventory, loadout, message) {
     shirt: loadout.shirt || "",
     pants: loadout.pants || "",
     shoes: loadout.shoes || "",
+    hair: loadout.hair || "",
     miscellaneous: Array.isArray(loadout.miscellaneous) ? loadout.miscellaneous : [],
     rev: loadout.revision || 0
   }).token;
-  return { ok: true, message, crowns: inventory.crowns, owned: inventory.owned, hat: loadout.hat || "", shirt: loadout.shirt || "", pants: loadout.pants || "", shoes: loadout.shoes || "", miscellaneous: Array.isArray(loadout.miscellaneous) ? loadout.miscellaneous : [], revision: loadout.revision || 0, receipt };
+  return { ok: true, message, crowns: inventory.crowns, owned: inventory.owned, hat: loadout.hat || "", shirt: loadout.shirt || "", pants: loadout.pants || "", shoes: loadout.shoes || "", hair: loadout.hair || "", miscellaneous: Array.isArray(loadout.miscellaneous) ? loadout.miscellaneous : [], revision: loadout.revision || 0, receipt };
 }
 
 async function authenticateShopRequest(req, res) {
