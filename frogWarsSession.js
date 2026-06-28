@@ -444,10 +444,12 @@ export function requireFrogSession(req, res) {
 // ---------------------------------------------------------------------------
 
 // linkAccount is an optional async (itchUserId, itchUsername, playFabId) => void
-// used to persist the itch<->PlayFab mapping (e.g. into PlayFab). Optional so the
-// module has no hard dependency on the PlayFab helpers in server.js.
+// used to persist the itch<->PlayFab mapping (e.g. into PlayFab). resolvePlayFabAccount
+// is an optional async (itchUserId, itchUsername) => { playFabId, sessionTicket,
+// newlyCreated } used to make itch identity resolve to the same PlayFab account on
+// every PC. Both are optional so this module has no hard dependency on PlayFab helpers.
 export function registerItchOwnershipRoutes(app, options = {}) {
-  const { linkAccount = null } = options;
+  const { linkAccount = null, resolvePlayFabAccount = null } = options;
 
   // Expose the public verification key so the Unity build can fetch/bundle it.
   app.get("/auth/itch/public-key", (_req, res) => {
@@ -468,7 +470,7 @@ export function registerItchOwnershipRoutes(app, options = {}) {
     if (!accessToken)
       return res.status(400).json({ ok: false, error: "accessToken is required" });
 
-    const playFabId = typeof req.body?.playFabId === "string" ? req.body.playFabId.trim() : null;
+    const requestedPlayFabId = typeof req.body?.playFabId === "string" ? req.body.playFabId.trim() : null;
 
     let result;
     try {
@@ -489,7 +491,20 @@ export function registerItchOwnershipRoutes(app, options = {}) {
       return res.json({ ok: true, ownershipVerified: false });
     }
 
-    // Verified owner -> optionally persist link, then mint token.
+    // Verified owner -> resolve the canonical PlayFab account, optionally persist
+    // the link, then mint a token whose pf claim matches that account.
+    let playFabAccount = null;
+    if (typeof resolvePlayFabAccount === "function") {
+      try {
+        playFabAccount = await resolvePlayFabAccount(result.itchUserId, result.itchUsername);
+      } catch (error) {
+        console.warn(`[itch] PlayFab account resolve failed: ${error.message}`);
+        return res.status(502).json({ ok: false, error: "Could not load your Frog Wars account. Please try again." });
+      }
+    }
+
+    const playFabId = String(playFabAccount?.playFabId ?? requestedPlayFabId ?? "").trim() || null;
+
     if (typeof linkAccount === "function") {
       try {
         await linkAccount(result.itchUserId, result.itchUsername, playFabId);
@@ -511,7 +526,10 @@ export function registerItchOwnershipRoutes(app, options = {}) {
       ownershipVerified: true,
       token,
       expiresAtUnixMs,
-      itchUsername: result.itchUsername ?? null
+      itchUsername: result.itchUsername ?? null,
+      playFabId,
+      sessionTicket: playFabAccount?.sessionTicket ?? null,
+      playFabNewlyCreated: Boolean(playFabAccount?.newlyCreated)
     });
   });
 

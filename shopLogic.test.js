@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { normalizeCatalogItem, normalizeHexColor, purchaseDecision, updateMiscellaneousSelection, validateEquipSelection } from "./shopLogic.js";
+import { mergeArcadeProgress, normalizeArcadeProgress, normalizeCatalogItem, normalizeHexColor, purchaseDecision, updateMiscellaneousSelection, validateEquipSelection } from "./shopLogic.js";
 
 test("purchase rejects insufficient balance and accepts owned idempotently", () => {
   assert.equal(purchaseDecision(4, 5, false).error, "insufficient-crowns");
@@ -44,4 +44,33 @@ test("hair color normalizes to canonical RRGGBBAA or empty", () => {
   assert.equal(normalizeHexColor(""), "");
   assert.equal(normalizeHexColor("xyz"), "");
   assert.equal(normalizeHexColor("12345"), "");
+});
+
+test("arcade progress normalizes and clamps unsafe save data", () => {
+  assert.deepEqual(normalizeArcadeProgress({
+    coinBalance: -10,
+    bestDistance: "42",
+    ownedSkins: ["plane-red", "../bad", "plane-red"],
+    selectedSkin: "../bad",
+    upgradeLevels: { "engine": "3", "../bad": 99, "boost": 101 }
+  }), {
+    coinBalance: 0,
+    bestDistance: 42,
+    ownedSkins: ["plane-red"],
+    selectedSkin: "",
+    upgradeLevels: { engine: 3, boost: 100 }
+  });
+});
+
+test("arcade progress merge keeps highest values and union ownership", () => {
+  assert.deepEqual(mergeArcadeProgress(
+    { coinBalance: 5, bestDistance: 100, ownedSkins: ["green"], selectedSkin: "green", upgradeLevels: { engine: 1 } },
+    { coinBalance: 3, bestDistance: 120, ownedSkins: ["red"], selectedSkin: "red", upgradeLevels: { engine: 2, fuel: 1 } }
+  ), {
+    coinBalance: 5,
+    bestDistance: 120,
+    ownedSkins: ["green", "red"],
+    selectedSkin: "red",
+    upgradeLevels: { engine: 2, fuel: 1 }
+  });
 });

@@ -1,7 +1,7 @@
 import express from "express";
 import cors from "cors";
 import crypto from "crypto";
-import { normalizeCatalogItem, normalizeHexColor, purchaseDecision, SHOP_SLOTS, updateMiscellaneousSelection, validateEquipSelection } from "./shopLogic.js";
+import { mergeArcadeProgress, normalizeArcadeProgress, normalizeCatalogItem, normalizeHexColor, purchaseDecision, SHOP_SLOTS, updateMiscellaneousSelection, validateEquipSelection } from "./shopLogic.js";
 import {
   registerItchOwnershipRoutes,
   requireFrogSession,
@@ -26,6 +26,8 @@ const PLAYFAB_API_BASE = PLAYFAB_TITLE_ID ? `https://${PLAYFAB_TITLE_ID}.playfab
 const SHOP_CURRENCY_CODE = (process.env.SHOP_CURRENCY_CODE ?? "CR").trim().toUpperCase();
 const SHOP_CATALOG_VERSION = (process.env.SHOP_CATALOG_VERSION ?? "Cosmetics").trim();
 const SHOP_ADMIN_TOKEN = (process.env.SHOP_ADMIN_TOKEN ?? "").trim();
+const ACCOUNT_LINK_HMAC_SECRET = (process.env.ACCOUNT_LINK_HMAC_SECRET ?? process.env.FROGWARS_ACCOUNT_LINK_HMAC_SECRET ?? PLAYFAB_SECRET_KEY).trim();
+const ARCADE_PROGRESS_KEY = "ArcadeProgressJson";
 const SHOP_ITEMS = new Map([
   ["america-first-hat", { displayName: "America First Hat", slot: "hat", price: 5 }],
   ["shtreimel", { displayName: "Shtreimel", slot: "hat", price: 8 }],
@@ -399,6 +401,38 @@ async function authenticateSessionTicket(sessionTicket) {
   return playFabId;
 }
 
+function playFabServerCustomIdForItch(itchUserId) {
+  const id = String(itchUserId ?? "").trim();
+  if (!id) throw new Error("itchUserId is required");
+  if (!ACCOUNT_LINK_HMAC_SECRET) throw new Error("ACCOUNT_LINK_HMAC_SECRET is not configured");
+  return "itch_" + crypto
+    .createHmac("sha256", ACCOUNT_LINK_HMAC_SECRET)
+    .update(id)
+    .digest("hex")
+    .slice(0, 48);
+}
+
+async function loginPlayFabWithItch(itchUserId) {
+  const data = await playFabServerRequest("/Server/LoginWithServerCustomId", {
+    ServerCustomId: playFabServerCustomIdForItch(itchUserId),
+    CreateAccount: true
+  });
+
+  const playFabId = sanitizePlayFabId(data?.PlayFabId);
+  const sessionTicket = String(data?.SessionTicket ?? "").trim();
+  if (!playFabId || !sessionTicket) {
+    const error = new Error("PlayFab did not return a session ticket");
+    error.status = 502;
+    throw error;
+  }
+
+  return {
+    playFabId,
+    sessionTicket,
+    newlyCreated: Boolean(data?.NewlyCreated)
+  };
+}
+
 async function getPlayerStatistic(playFabId, statisticName) {
   const data = await playFabServerRequest("/Server/GetPlayerStatistics", {
     PlayFabId: playFabId,
@@ -408,6 +442,25 @@ async function getPlayerStatistic(playFabId, statisticName) {
   const stats = Array.isArray(data?.Statistics) ? data.Statistics : [];
   const match = stats.find(stat => stat?.StatisticName === statisticName);
   return parseNonNegativeInteger(match?.Value, 0);
+}
+
+async function getReadOnlyData(playFabId, keys) {
+  const data = await playFabServerRequest("/Server/GetUserReadOnlyData", {
+    PlayFabId: playFabId,
+    Keys: keys
+  });
+  const values = data?.Data ?? {};
+  const result = {};
+  for (const key of keys)
+    result[key] = String(values?.[key]?.Value ?? "").trim();
+  return result;
+}
+
+async function updateReadOnlyData(playFabId, data) {
+  await playFabServerRequest("/Server/UpdateUserReadOnlyData", {
+    PlayFabId: playFabId,
+    Data: data
+  });
 }
 
 async function updatePlayerStatistic(playFabId, statisticName, value) {
@@ -439,6 +492,16 @@ async function subtractShopCrowns(playFabId, amount) {
     PlayFabId: playFabId,
     VirtualCurrency: SHOP_CURRENCY_CODE,
     Amount: delta
+  });
+}
+
+async function grantShopItems(playFabId, itemIds) {
+  const items = [...new Set((Array.isArray(itemIds) ? itemIds : []).map(id => String(id ?? "").trim()).filter(Boolean))];
+  if (items.length === 0) return;
+  await playFabServerRequest("/Server/GrantItemsToUser", {
+    PlayFabId: playFabId,
+    CatalogVersion: SHOP_CATALOG_VERSION,
+    ItemIds: items
   });
 }
 
@@ -529,7 +592,37 @@ function shopResponse(playFabId, inventory, loadout, message) {
   return { ok: true, message, crowns: inventory.crowns, owned: inventory.owned, hat: loadout.hat || "", shirt: loadout.shirt || "", pants: loadout.pants || "", shoes: loadout.shoes || "", hair: loadout.hair || "", hairColor: loadout.hairColor || "", miscellaneous: Array.isArray(loadout.miscellaneous) ? loadout.miscellaneous : [], revision: loadout.revision || 0, receipt };
 }
 
-async function authenticateShopRequest(req, res) {
+async function getArcadeProgress(playFabId) {
+  const data = await getReadOnlyData(playFabId, [ARCADE_PROGRESS_KEY]);
+  try {
+    return normalizeArcadeProgress(JSON.parse(data[ARCADE_PROGRESS_KEY] || "{}"));
+  } catch {
+    return normalizeArcadeProgress({});
+  }
+}
+
+async function saveArcadeProgress(playFabId, progress) {
+  const normalized = normalizeArcadeProgress(progress);
+  await updateReadOnlyData(playFabId, {
+    [ARCADE_PROGRESS_KEY]: JSON.stringify(normalized)
+  });
+  return normalized;
+}
+
+function arcadeProgressForUnity(progress) {
+  const normalized = normalizeArcadeProgress(progress);
+  return {
+    coinBalance: normalized.coinBalance,
+    bestDistance: normalized.bestDistance,
+    ownedSkins: normalized.ownedSkins,
+    upgradeLevels: Object.entries(normalized.upgradeLevels)
+      .map(([itemId, level]) => ({ itemId, level }))
+      .sort((a, b) => a.itemId.localeCompare(b.itemId)),
+    selectedSkin: normalized.selectedSkin
+  };
+}
+
+async function authenticatePlayFabSessionRequest(req, res) {
   const frogSession = requireFrogSession(req, res);
   if (!frogSession) return null;
   const playFabId = await authenticateSessionTicket(req.body?.sessionTicket);
@@ -544,6 +637,21 @@ async function authenticateShopRequest(req, res) {
     return null;
   }
   return playFabId;
+}
+
+async function authenticateShopRequest(req, res) {
+  return authenticatePlayFabSessionRequest(req, res);
+}
+
+function isLoadoutEmpty(loadout) {
+  return !loadout ||
+    !loadout.hat &&
+    !loadout.shirt &&
+    !loadout.pants &&
+    !loadout.shoes &&
+    !loadout.hair &&
+    !loadout.hairColor &&
+    (!Array.isArray(loadout.miscellaneous) || loadout.miscellaneous.length === 0);
 }
 
 function pruneLeaderboardReceipts() {
@@ -716,16 +824,18 @@ app.get("/config", async (req, res) => {
 // linkAccount persists the itch<->PlayFab mapping into PlayFab user data when
 // both PlayFab is configured and a playFabId is supplied (best-effort, non-fatal).
 registerItchOwnershipRoutes(app, {
+  resolvePlayFabAccount: async (itchUserId) => {
+    if (!playFabConfigured())
+      return null;
+    return loginPlayFabWithItch(itchUserId);
+  },
   linkAccount: async (itchUserId, itchUsername, playFabId) => {
     if (!playFabConfigured() || !playFabId)
       return;
-    await playFabServerRequest("/Server/UpdateUserReadOnlyData", {
-      PlayFabId: playFabId,
-      Data: {
-        ItchUserId: String(itchUserId ?? ""),
-        ItchUsername: String(itchUsername ?? ""),
-        ItchLinkedAtUnixMs: String(Date.now())
-      }
+    await updateReadOnlyData(playFabId, {
+      ItchUserId: String(itchUserId ?? ""),
+      ItchUsername: String(itchUsername ?? ""),
+      ItchLinkedAtUnixMs: String(Date.now())
     });
   }
 });
@@ -901,6 +1011,126 @@ app.post("/leaderboards/tournament/match-results", async (req, res) => {
     const status = error.status === 401 ? 401 : 500;
     console.warn(`[leaderboards] Tournament result submit failed: ${error.message}`);
     return res.status(status).json({ ok: false, accepted: false, error: status === 401 ? "Invalid PlayFab session ticket" : "Backend PlayFab tournament update failed" });
+  }
+});
+
+app.post("/account/migrate-legacy-playfab", async (req, res) => {
+  if (!requirePlayFabConfigured(res)) return;
+  try {
+    const targetPlayFabId = await authenticatePlayFabSessionRequest(req, res);
+    if (!targetPlayFabId) return;
+
+    const legacyPlayFabId = await authenticateSessionTicket(req.body?.legacySessionTicket);
+    if (legacyPlayFabId === targetPlayFabId)
+      return res.json({ ok: true, accepted: false, message: "Legacy account already matches this account." });
+
+    const migrationData = await getReadOnlyData(legacyPlayFabId, [
+      "AccountPortabilityMigratedTo",
+      "AccountPortabilityMigratedAtUnixMs"
+    ]);
+    const migratedTo = sanitizePlayFabId(migrationData.AccountPortabilityMigratedTo);
+    if (migratedTo) {
+      if (migratedTo === targetPlayFabId)
+        return res.json({ ok: true, accepted: false, message: "Legacy account was already migrated." });
+      return res.status(409).json({ ok: false, accepted: false, error: "Legacy account has already been migrated." });
+    }
+
+    await refreshShopCatalog();
+    const [
+      legacyHighScore,
+      targetHighScore,
+      legacyTournamentCrowns,
+      targetTournamentCrowns,
+      legacyInventory,
+      targetInventory,
+      legacyLoadout,
+      targetLoadout,
+      legacyArcade,
+      targetArcade
+    ] = await Promise.all([
+      getPlayerStatistic(legacyPlayFabId, "HighScore"),
+      getPlayerStatistic(targetPlayFabId, "HighScore"),
+      getPlayerStatistic(legacyPlayFabId, "TournamentCrownsEarned"),
+      getPlayerStatistic(targetPlayFabId, "TournamentCrownsEarned"),
+      getShopInventory(legacyPlayFabId),
+      getShopInventory(targetPlayFabId),
+      getShopLoadout(legacyPlayFabId),
+      getShopLoadout(targetPlayFabId),
+      getArcadeProgress(legacyPlayFabId),
+      getArcadeProgress(targetPlayFabId)
+    ]);
+
+    const updates = {};
+    if (legacyHighScore > targetHighScore) {
+      await updatePlayerStatistic(targetPlayFabId, "HighScore", legacyHighScore);
+      updates.highScore = legacyHighScore;
+    }
+    if (legacyTournamentCrowns > targetTournamentCrowns) {
+      await updatePlayerStatistic(targetPlayFabId, "TournamentCrownsEarned", legacyTournamentCrowns);
+      updates.tournamentCrownsEarned = legacyTournamentCrowns;
+    }
+
+    const missingOwned = legacyInventory.owned.filter(itemId => !targetInventory.owned.includes(itemId));
+    if (missingOwned.length > 0) {
+      await grantShopItems(targetPlayFabId, missingOwned);
+      updates.grantedCosmetics = missingOwned.length;
+    }
+
+    if (legacyInventory.crowns > 0) {
+      await addShopCrowns(targetPlayFabId, legacyInventory.crowns);
+      updates.crownsAdded = legacyInventory.crowns;
+    }
+
+    if (isLoadoutEmpty(targetLoadout) && !isLoadoutEmpty(legacyLoadout)) {
+      await saveShopLoadout(targetPlayFabId, legacyLoadout);
+      updates.loadoutCopied = true;
+    }
+
+    const mergedArcade = mergeArcadeProgress(targetArcade, legacyArcade);
+    await saveArcadeProgress(targetPlayFabId, mergedArcade);
+    updates.arcadeProgressMerged = true;
+
+    await updateReadOnlyData(legacyPlayFabId, {
+      AccountPortabilityMigratedTo: targetPlayFabId,
+      AccountPortabilityMigratedAtUnixMs: String(Date.now())
+    });
+
+    return res.json({ ok: true, accepted: true, message: "Legacy account migrated.", updates });
+  } catch (error) {
+    const status = error.status === 401 ? 401 : 500;
+    console.warn(`[account] Legacy migration failed: ${error.message}`);
+    return res.status(status).json({ ok: false, accepted: false, error: status === 401 ? "Invalid PlayFab session ticket" : "Legacy account migration failed" });
+  }
+});
+
+app.post("/arcade/profile", async (req, res) => {
+  if (!requirePlayFabConfigured(res)) return;
+  try {
+    const playFabId = await authenticatePlayFabSessionRequest(req, res);
+    if (!playFabId) return;
+    const progress = await getArcadeProgress(playFabId);
+    return res.json({ ok: true, progress: arcadeProgressForUnity(progress) });
+  } catch (error) {
+    const status = error.status === 401 ? 401 : 500;
+    console.warn(`[arcade] Profile failed: ${error.message}`);
+    return res.status(status).json({ ok: false, error: status === 401 ? "Invalid PlayFab session ticket" : "Could not load arcade progress" });
+  }
+});
+
+app.post("/arcade/save", async (req, res) => {
+  if (!requirePlayFabConfigured(res)) return;
+  try {
+    const playFabId = await authenticatePlayFabSessionRequest(req, res);
+    if (!playFabId) return;
+    const current = await getArcadeProgress(playFabId);
+    const incoming = req.body?.progress ?? req.body;
+    const merged = mergeArcadeProgress(current, incoming);
+    const saved = await saveArcadeProgress(playFabId, merged);
+    return res.json({ ok: true, progress: arcadeProgressForUnity(saved) });
+  } catch (error) {
+    const status = error.status === 401 ? 401 : 500;
+    console.warn(`[arcade] Save failed: ${error.message}`);
+    return res.status(status).json({ ok: false, error: status === 401 ? "Invalid PlayFab session ticket" : "Could not save arcade progress" });
   }
 });
 

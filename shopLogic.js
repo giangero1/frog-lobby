@@ -49,3 +49,80 @@ export function normalizeCatalogItem(raw, currencyCode) {
     CustomData: JSON.stringify({ slot })
   };
 }
+
+export function normalizeArcadeProgress(raw, allowedItemIds = null) {
+  const allowed = allowedItemIds instanceof Set ? allowedItemIds : null;
+  const coinBalance = clampInt(raw?.coinBalance, 0, 999999999);
+  const bestDistance = clampInt(raw?.bestDistance, 0, 1000000000);
+  const selectedSkin = normalizeArcadeItemId(raw?.selectedSkin, allowed);
+  const ownedSkins = normalizeArcadeItemList(raw?.ownedSkins, allowed);
+  const upgradeLevels = {};
+  const inputUpgrades = raw?.upgradeLevels;
+  if (Array.isArray(inputUpgrades)) {
+    for (const entry of inputUpgrades) {
+      const itemId = normalizeArcadeItemId(entry?.itemId, allowed);
+      if (!itemId) continue;
+      upgradeLevels[itemId] = clampInt(entry?.level, 0, 100);
+    }
+  } else if (inputUpgrades && typeof inputUpgrades === "object") {
+    for (const [key, value] of Object.entries(inputUpgrades)) {
+      const itemId = normalizeArcadeItemId(key, allowed);
+      if (!itemId) continue;
+      upgradeLevels[itemId] = clampInt(value, 0, 100);
+    }
+  }
+
+  return {
+    coinBalance,
+    bestDistance,
+    ownedSkins,
+    upgradeLevels,
+    selectedSkin: selectedSkin && ownedSkins.includes(selectedSkin) ? selectedSkin : ""
+  };
+}
+
+export function mergeArcadeProgress(existing, incoming, allowedItemIds = null) {
+  const current = normalizeArcadeProgress(existing, allowedItemIds);
+  const next = normalizeArcadeProgress(incoming, allowedItemIds);
+  const owned = new Set([...current.ownedSkins, ...next.ownedSkins]);
+  const upgradeLevels = { ...current.upgradeLevels };
+  for (const [itemId, level] of Object.entries(next.upgradeLevels))
+    upgradeLevels[itemId] = Math.max(upgradeLevels[itemId] ?? 0, level);
+
+  const selectedSkin = next.selectedSkin && owned.has(next.selectedSkin)
+    ? next.selectedSkin
+    : current.selectedSkin && owned.has(current.selectedSkin)
+      ? current.selectedSkin
+      : "";
+
+  return {
+    coinBalance: Math.max(current.coinBalance, next.coinBalance),
+    bestDistance: Math.max(current.bestDistance, next.bestDistance),
+    ownedSkins: [...owned].sort(),
+    upgradeLevels,
+    selectedSkin
+  };
+}
+
+function normalizeArcadeItemList(value, allowed) {
+  const source = Array.isArray(value) ? value : [];
+  const items = new Set();
+  for (const raw of source) {
+    const itemId = normalizeArcadeItemId(raw, allowed);
+    if (itemId) items.add(itemId);
+  }
+  return [...items].sort();
+}
+
+function normalizeArcadeItemId(value, allowed) {
+  const itemId = String(value ?? "").trim();
+  if (!itemId || itemId.length > 80 || !/^[a-z0-9][a-z0-9_.-]*$/i.test(itemId)) return "";
+  if (allowed && !allowed.has(itemId)) return "";
+  return itemId;
+}
+
+function clampInt(value, min, max) {
+  const parsed = Number.isFinite(value) ? Math.floor(value) : Number.parseInt(value, 10);
+  if (!Number.isInteger(parsed)) return min;
+  return Math.min(max, Math.max(min, parsed));
+}
