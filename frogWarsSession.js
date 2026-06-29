@@ -33,6 +33,8 @@ const ITCH_OWNERSHIP_ENABLED = (process.env.ITCH_OWNERSHIP_ENABLED ?? "true").to
 
 const SESSION_TTL_HOURS = clampNumber(Number.parseInt(process.env.FROGWARS_SESSION_TTL_HOURS ?? "16", 10), 1, 24, 16);
 const SESSION_TTL_SECONDS = SESSION_TTL_HOURS * 3600;
+const REMEMBER_LOGIN_DAYS = clampNumber(Number.parseInt(process.env.FROGWARS_REMEMBER_LOGIN_DAYS ?? "14", 10), 1, 30, 14);
+const REMEMBER_LOGIN_SECONDS = REMEMBER_LOGIN_DAYS * 24 * 3600;
 // How long after issue a token may still be auto-refreshed without a fresh itch re-verify.
 const SESSION_REFRESH_CUTOFF_SECONDS = clampNumber(
   Number.parseInt(process.env.FROGWARS_SESSION_REFRESH_CUTOFF_HOURS ?? "72", 10) * 3600,
@@ -139,7 +141,7 @@ export function missingConfigList() {
 
 export function configSummaryForLog() {
   if (!ITCH_OWNERSHIP_ENABLED) return "itch ownership: DISABLED (ITCH_OWNERSHIP_ENABLED=false)";
-  if (isConfigured()) return `itch ownership: ENFORCED (game ${maskId(ITCH_GAME_ID)}, ttl ${SESSION_TTL_HOURS}h)`;
+  if (isConfigured()) return `itch ownership: ENFORCED (game ${maskId(ITCH_GAME_ID)}, ttl ${SESSION_TTL_HOURS}h, remember ${REMEMBER_LOGIN_DAYS}d)`;
   const reason = keyLoadError ? `key error: ${keyLoadError}` : `missing: ${missingConfigList().join(", ")}`;
   return `itch ownership: NOT ENFORCED (not configured — ${reason})`;
 }
@@ -154,7 +156,8 @@ export function configPayloadFields() {
     itchOwnershipEnforced: isEnforced(),
     itchOwnershipConfigured: isConfigured(),
     itchOauthClientId: isConfigured() ? ITCH_OAUTH_CLIENT_ID : null,
-    frogSessionTtlHours: SESSION_TTL_HOURS
+    frogSessionTtlHours: SESSION_TTL_HOURS,
+    frogRememberLoginDays: REMEMBER_LOGIN_DAYS
   };
 }
 
@@ -179,6 +182,34 @@ export function mintSessionToken({ itchUserId, playFabId, ownershipVerified = tr
     dev: Boolean(dev),
     iat: nowSeconds,
     exp: nowSeconds + SESSION_TTL_SECONDS
+  };
+
+  const signingInput = `${base64UrlEncode(JSON.stringify(header))}.${base64UrlEncode(JSON.stringify(payload))}`;
+  const signature = crypto.sign("RSA-SHA256", Buffer.from(signingInput, "utf8"), privateKeyObj);
+  const token = `${signingInput}.${base64UrlEncode(signature)}`;
+
+  return { token, payload, expiresAtUnixMs: payload.exp * 1000 };
+}
+
+export function mintRememberToken({ itchUserId, itchUsername, playFabId, dev = false }) {
+  if (!privateKeyObj) throw new Error("Signing key not configured");
+
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const itchUserIdString = String(itchUserId ?? "");
+  const frogUserId = crypto.createHash("sha256").update(`frogwars:${itchUserIdString}`).digest("hex").slice(0, 24);
+
+  const header = { alg: "RS256", typ: "JWT" };
+  const payload = {
+    v: TOKEN_VERSION,
+    purpose: "remember-login",
+    sub: frogUserId,
+    itch: itchUserIdString,
+    itchUsername: itchUsername ? String(itchUsername) : null,
+    pf: playFabId ? String(playFabId) : null,
+    own: true,
+    dev: Boolean(dev),
+    iat: nowSeconds,
+    exp: nowSeconds + REMEMBER_LOGIN_SECONDS
   };
 
   const signingInput = `${base64UrlEncode(JSON.stringify(header))}.${base64UrlEncode(JSON.stringify(payload))}`;
@@ -248,6 +279,17 @@ export function verifySessionToken(token) {
     return { valid: false, reason: "not-owner" };
 
   return { valid: true, payload };
+}
+
+export function verifyRememberToken(token) {
+  const result = verifySessionToken(token);
+  if (!result.valid)
+    return result;
+
+  if (result.payload?.purpose !== "remember-login")
+    return { valid: false, reason: "wrong-purpose" };
+
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -519,6 +561,12 @@ export function registerItchOwnershipRoutes(app, options = {}) {
       ownershipVerified: true,
       dev: false
     });
+    const { token: rememberToken, expiresAtUnixMs: rememberExpiresAtUnixMs } = mintRememberToken({
+      itchUserId: result.itchUserId,
+      itchUsername: result.itchUsername,
+      playFabId,
+      dev: false
+    });
 
     console.log(`[itch] verify: itch=${maskId(result.itchUserId)} VERIFIED owner, token ttl ${SESSION_TTL_HOURS}h`);
     return res.json({
@@ -526,6 +574,8 @@ export function registerItchOwnershipRoutes(app, options = {}) {
       ownershipVerified: true,
       token,
       expiresAtUnixMs,
+      rememberToken,
+      rememberExpiresAtUnixMs,
       itchUsername: result.itchUsername ?? null,
       playFabId,
       sessionTicket: playFabAccount?.sessionTicket ?? null,
@@ -556,6 +606,49 @@ export function registerItchOwnershipRoutes(app, options = {}) {
       dev: Boolean(result.payload.dev)
     });
     return res.json({ ok: true, token: fresh, expiresAtUnixMs });
+  });
+
+  // Mint a fresh short-lived Frog Wars session from a remembered-login token.
+  // The remember token itself is not renewed here; after its absolute expiry the
+  // player must perform the browser OAuth flow again.
+  app.post("/auth/itch/remember", async (req, res) => {
+    if (!isConfigured())
+      return res.status(503).json({ ok: false, error: "itch ownership is not configured on the backend." });
+
+    const token = String(req.body?.rememberToken ?? "").trim();
+    const result = verifyRememberToken(token);
+    if (!result.valid)
+      return res.status(401).json({ ok: false, error: "Remembered login expired. Please login again.", reason: result.reason });
+
+    let playFabAccount = null;
+    if (typeof resolvePlayFabAccount === "function") {
+      try {
+        playFabAccount = await resolvePlayFabAccount(result.payload.itch, result.payload.itchUsername);
+      } catch (error) {
+        console.warn(`[itch] remembered PlayFab account resolve failed: ${error.message}`);
+        return res.status(502).json({ ok: false, error: "Could not load your Frog Wars account. Please try again." });
+      }
+    }
+
+    const playFabId = String(playFabAccount?.playFabId ?? result.payload.pf ?? "").trim() || null;
+    const { token: fresh, expiresAtUnixMs } = mintSessionToken({
+      itchUserId: result.payload.itch,
+      playFabId,
+      ownershipVerified: true,
+      dev: Boolean(result.payload.dev)
+    });
+
+    return res.json({
+      ok: true,
+      ownershipVerified: true,
+      token: fresh,
+      expiresAtUnixMs,
+      itchUsername: result.payload.itchUsername ?? null,
+      playFabId,
+      sessionTicket: playFabAccount?.sessionTicket ?? null,
+      playFabNewlyCreated: Boolean(playFabAccount?.newlyCreated),
+      rememberExpiresAtUnixMs: result.payload.exp * 1000
+    });
   });
 
   // Dev-only token mint, impossible without the server-side ITCH_DEV_BYPASS_TOKEN.
