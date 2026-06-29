@@ -1,4 +1,5 @@
 export const SHOP_SLOTS = new Set(["hat", "shirt", "pants", "shoes", "hair", "miscellaneous"]);
+export const SHOP_KINDS = new Set(["cosmetic", "emote"]);
 
 export function purchaseDecision(balance, price, alreadyOwned) {
   if (alreadyOwned) return { ok: true, alreadyOwned: true };
@@ -23,6 +24,34 @@ export function updateMiscellaneousSelection(current, itemId, equipped, limit = 
   return [...items].slice(0, limit);
 }
 
+export function normalizeEmoteWheel(current, owned = null, limit = 8) {
+  const ownedSet = Array.isArray(owned) ? new Set(owned.map(x => String(x).trim()).filter(Boolean)) : null;
+  const source = Array.isArray(current) ? current : [];
+  const wheel = [];
+  for (let i = 0; i < limit; i++) {
+    const itemId = String(source[i] ?? "").trim();
+    wheel.push(itemId && (!ownedSet || ownedSet.has(itemId)) ? itemId : "");
+  }
+  return wheel;
+}
+
+export function updateEmoteWheelSlot(current, slot, itemId, owned, limit = 8) {
+  const index = Number.isInteger(slot) ? slot : Number.parseInt(slot, 10);
+  if (!Number.isInteger(index) || index < 0 || index >= limit) return { ok: false, error: "invalid-wheel-slot" };
+  const normalizedId = String(itemId ?? "").trim();
+  if (normalizedId && (!Array.isArray(owned) || !owned.includes(normalizedId))) return { ok: false, error: "not-owned" };
+  const wheel = normalizeEmoteWheel(current, owned, limit);
+  wheel[index] = normalizedId;
+  return { ok: true, wheel };
+}
+
+export function validateVictoryEmote(itemId, owned) {
+  const normalizedId = String(itemId ?? "").trim();
+  if (!normalizedId) return { ok: true, itemId: "" };
+  if (!Array.isArray(owned) || !owned.includes(normalizedId)) return { ok: false, error: "not-owned" };
+  return { ok: true, itemId: normalizedId };
+}
+
 /**
  * Normalizes a hair-color hex string to canonical 8-digit "RRGGBBAA" upper-case, or "" when
  * empty/invalid. Accepts optional leading '#', and 6- or 8-digit hex (6 implies opaque alpha).
@@ -38,15 +67,19 @@ export function normalizeHexColor(value) {
 
 export function normalizeCatalogItem(raw, currencyCode) {
   const itemId = String(raw?.itemId ?? "").trim();
+  const explicitKind = String(raw?.kind ?? raw?.type ?? "").trim().toLowerCase();
   const slot = String(raw?.slot ?? "").trim().toLowerCase();
+  const kind = explicitKind || (slot ? "cosmetic" : "emote");
   const price = Number.isFinite(raw?.price) ? Math.floor(raw.price) : Number.parseInt(raw?.price, 10);
-  if (!itemId || !SHOP_SLOTS.has(slot) || !Number.isInteger(price) || price < 0)
+  if (!itemId || !SHOP_KINDS.has(kind) || !Number.isInteger(price) || price < 0)
+    throw new Error("Catalog contains an invalid item.");
+  if (kind === "cosmetic" && !SHOP_SLOTS.has(slot))
     throw new Error("Catalog contains an invalid item.");
   return {
     ItemId: itemId,
     DisplayName: String(raw?.displayName ?? itemId).slice(0, 80),
     VirtualCurrencyPrices: { [currencyCode]: price },
-    CustomData: JSON.stringify({ slot })
+    CustomData: JSON.stringify(kind === "emote" ? { kind: "emote" } : { kind: "cosmetic", slot })
   };
 }
 

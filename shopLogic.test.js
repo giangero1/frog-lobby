@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mergeArcadeProgress, normalizeArcadeProgress, normalizeCatalogItem, normalizeHexColor, purchaseDecision, updateMiscellaneousSelection, validateEquipSelection } from "./shopLogic.js";
+import { mergeArcadeProgress, normalizeArcadeProgress, normalizeCatalogItem, normalizeEmoteWheel, normalizeHexColor, purchaseDecision, updateEmoteWheelSlot, updateMiscellaneousSelection, validateEquipSelection, validateVictoryEmote } from "./shopLogic.js";
 
 test("purchase rejects insufficient balance and accepts owned idempotently", () => {
   assert.equal(purchaseDecision(4, 5, false).error, "insufficient-crowns");
@@ -18,8 +18,14 @@ test("equip requires ownership and the matching slot", () => {
 
 test("catalog accepts stackable miscellaneous cosmetics", () => {
   const item = normalizeCatalogItem({ itemId: "charlie-chaplin-mustache", displayName: "Charlie Chaplin Mustache", slot: "miscellaneous", price: 16 }, "CR");
-  assert.equal(item.CustomData, '{"slot":"miscellaneous"}');
+  assert.equal(item.CustomData, '{"kind":"cosmetic","slot":"miscellaneous"}');
   assert.equal(item.VirtualCurrencyPrices.CR, 16);
+});
+
+test("catalog accepts emote entries with emote custom data", () => {
+  const item = normalizeCatalogItem({ itemId: "wave", displayName: "Wave", kind: "emote", price: 0 }, "CR");
+  assert.equal(item.CustomData, '{"kind":"emote"}');
+  assert.equal(item.VirtualCurrencyPrices.CR, 0);
 });
 
 test("miscellaneous cosmetics equip independently and can all be cleared", () => {
@@ -33,9 +39,22 @@ test("catalog publishing normalizes safe PlayFab entries", () => {
     ItemId: "king-crown",
     DisplayName: "King Crown",
     VirtualCurrencyPrices: { CR: 20 },
-    CustomData: "{\"slot\":\"hat\"}"
+    CustomData: "{\"kind\":\"cosmetic\",\"slot\":\"hat\"}"
   });
   assert.throws(() => normalizeCatalogItem({ itemId: "bad", slot: "weapon", price: 1 }, "CR"));
+});
+
+test("emote wheel normalization and slot updates require owned emotes", () => {
+  assert.deepEqual(normalizeEmoteWheel(["wave", "bad"], ["wave"]), ["wave", "", "", "", "", "", "", ""]);
+  assert.equal(updateEmoteWheelSlot([], 8, "wave", ["wave"]).error, "invalid-wheel-slot");
+  assert.equal(updateEmoteWheelSlot([], 0, "wave", []).error, "not-owned");
+  assert.deepEqual(updateEmoteWheelSlot([], 0, "wave", ["wave"]).wheel, ["wave", "", "", "", "", "", "", ""]);
+});
+
+test("victory emote validation requires ownership but allows clearing", () => {
+  assert.deepEqual(validateVictoryEmote("", []), { ok: true, itemId: "" });
+  assert.equal(validateVictoryEmote("dance", ["wave"]).error, "not-owned");
+  assert.deepEqual(validateVictoryEmote("dance", ["dance"]), { ok: true, itemId: "dance" });
 });
 
 test("hair color normalizes to canonical RRGGBBAA or empty", () => {

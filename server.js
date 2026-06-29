@@ -1,7 +1,7 @@
 import express from "express";
 import cors from "cors";
 import crypto from "crypto";
-import { mergeArcadeProgress, normalizeArcadeProgress, normalizeCatalogItem, normalizeHexColor, purchaseDecision, SHOP_SLOTS, updateMiscellaneousSelection, validateEquipSelection } from "./shopLogic.js";
+import { mergeArcadeProgress, normalizeArcadeProgress, normalizeCatalogItem, normalizeEmoteWheel, normalizeHexColor, purchaseDecision, SHOP_SLOTS, updateEmoteWheelSlot, updateMiscellaneousSelection, validateEquipSelection, validateVictoryEmote } from "./shopLogic.js";
 import {
   registerItchOwnershipRoutes,
   requireFrogSession,
@@ -29,11 +29,13 @@ const SHOP_ADMIN_TOKEN = (process.env.SHOP_ADMIN_TOKEN ?? "").trim();
 const ACCOUNT_LINK_HMAC_SECRET = (process.env.ACCOUNT_LINK_HMAC_SECRET ?? process.env.FROGWARS_ACCOUNT_LINK_HMAC_SECRET ?? PLAYFAB_SECRET_KEY).trim();
 const ARCADE_PROGRESS_KEY = "ArcadeProgressJson";
 const SHOP_ITEMS = new Map([
-  ["america-first-hat", { displayName: "America First Hat", slot: "hat", price: 5 }],
-  ["shtreimel", { displayName: "Shtreimel", slot: "hat", price: 8 }],
-  ["crusader-helmet", { displayName: "Crusader Helmet", slot: "hat", price: 12 }],
-  ["king-crown", { displayName: "King Crown", slot: "hat", price: 20 }],
-  ["charlie-chaplin-mustache", { displayName: "Charlie Chaplin Mustache", slot: "miscellaneous", price: 16 }]
+  ["america-first-hat", { displayName: "America First Hat", kind: "cosmetic", slot: "hat", price: 5 }],
+  ["shtreimel", { displayName: "Shtreimel", kind: "cosmetic", slot: "hat", price: 8 }],
+  ["crusader-helmet", { displayName: "Crusader Helmet", kind: "cosmetic", slot: "hat", price: 12 }],
+  ["king-crown", { displayName: "King Crown", kind: "cosmetic", slot: "hat", price: 20 }],
+  ["charlie-chaplin-mustache", { displayName: "Charlie Chaplin Mustache", kind: "cosmetic", slot: "miscellaneous", price: 16 }],
+  ["wave", { displayName: "Wave", kind: "emote", price: 0 }],
+  ["cheer", { displayName: "Cheer", kind: "emote", price: 100 }]
 ]);
 let shopCatalogLastRefresh = 0;
 const ARCADE_RUN_TTL_MS = Math.max(60_000, Number.parseInt(process.env.ARCADE_RUN_TTL_SECONDS ?? "1800", 10) * 1000 || 1_800_000);
@@ -509,9 +511,19 @@ async function getShopInventory(playFabId) {
   await refreshShopCatalog();
   const data = await playFabServerRequest("/Server/GetUserInventory", { PlayFabId: playFabId });
   const inventory = Array.isArray(data?.Inventory) ? data.Inventory : [];
+  const owned = [];
+  const ownedEmotes = [];
+  for (const entry of inventory) {
+    const itemId = String(entry?.ItemId ?? "").trim();
+    const definition = SHOP_ITEMS.get(itemId);
+    if (!definition) continue;
+    if (definition.kind === "emote") ownedEmotes.push(itemId);
+    else owned.push(itemId);
+  }
   return {
     crowns: parseNonNegativeInteger(data?.VirtualCurrency?.[SHOP_CURRENCY_CODE], 0),
-    owned: [...new Set(inventory.map(entry => String(entry?.ItemId ?? "").trim()).filter(id => SHOP_ITEMS.has(id)))]
+    owned: [...new Set(owned)],
+    ownedEmotes: [...new Set(ownedEmotes)]
   };
 }
 
@@ -525,9 +537,12 @@ async function refreshShopCatalog(force = false) {
       const itemId = String(entry?.ItemId ?? "").trim();
       let custom = {};
       try { custom = JSON.parse(entry?.CustomData ?? "{}"); } catch { custom = {}; }
+      const kind = String(custom?.kind ?? (custom?.slot ? "cosmetic" : "emote")).trim().toLowerCase();
       const slot = String(custom?.slot ?? "hat").trim().toLowerCase();
       const rawPrice = entry?.VirtualCurrencyPrices?.[SHOP_CURRENCY_CODE];
-      if (itemId && SHOP_SLOTS.has(slot)) SHOP_ITEMS.set(itemId, { displayName: String(entry?.DisplayName ?? itemId), slot, price: parseNonNegativeInteger(rawPrice, 0) });
+      if (!itemId) continue;
+      if (kind === "emote") SHOP_ITEMS.set(itemId, { displayName: String(entry?.DisplayName ?? itemId), kind: "emote", price: parseNonNegativeInteger(rawPrice, 0) });
+      else if (SHOP_SLOTS.has(slot)) SHOP_ITEMS.set(itemId, { displayName: String(entry?.DisplayName ?? itemId), kind: "cosmetic", slot, price: parseNonNegativeInteger(rawPrice, 0) });
     }
   }
   shopCatalogLastRefresh = Date.now();
@@ -537,13 +552,15 @@ async function refreshShopCatalog(force = false) {
 async function getShopLoadout(playFabId) {
   const data = await playFabServerRequest("/Server/GetUserReadOnlyData", {
     PlayFabId: playFabId,
-    Keys: ["CosmeticHat", "CosmeticShirt", "CosmeticPants", "CosmeticShoes", "CosmeticHair", "CosmeticHairColor", "CosmeticMiscellaneous", "CosmeticRevision"]
+    Keys: ["CosmeticHat", "CosmeticShirt", "CosmeticPants", "CosmeticShoes", "CosmeticHair", "CosmeticHairColor", "CosmeticMiscellaneous", "CosmeticRevision", "EmoteWheel", "VictoryEmote", "EmoteRevision"]
   });
   const values = data?.Data ?? {};
   const value = key => String(values?.[key]?.Value ?? "").trim();
   let miscellaneous = [];
   try { miscellaneous = JSON.parse(value("CosmeticMiscellaneous") || "[]"); } catch { miscellaneous = []; }
   if (!Array.isArray(miscellaneous)) miscellaneous = [];
+  let emoteWheel = [];
+  try { emoteWheel = JSON.parse(value("EmoteWheel") || "[]"); } catch { emoteWheel = []; }
   return {
     hat: value("CosmeticHat"),
     shirt: value("CosmeticShirt"),
@@ -552,12 +569,16 @@ async function getShopLoadout(playFabId) {
     hair: value("CosmeticHair"),
     hairColor: value("CosmeticHairColor"),
     miscellaneous: [...new Set(miscellaneous.map(x => String(x).trim()).filter(Boolean))].slice(0, 16),
-    revision: parseNonNegativeInteger(value("CosmeticRevision"), 0)
+    revision: parseNonNegativeInteger(value("CosmeticRevision"), 0),
+    emoteWheel: normalizeEmoteWheel(emoteWheel),
+    victoryEmote: value("VictoryEmote"),
+    emoteRevision: parseNonNegativeInteger(value("EmoteRevision"), 0)
   };
 }
 
 async function saveShopLoadout(playFabId, loadout) {
   const revision = Math.max(Date.now(), parseNonNegativeInteger(loadout?.revision, 0) + 1);
+  const emoteRevision = Math.max(Date.now(), parseNonNegativeInteger(loadout?.emoteRevision, 0) + 1);
   await playFabServerRequest("/Server/UpdateUserReadOnlyData", {
     PlayFabId: playFabId,
     Data: {
@@ -568,10 +589,13 @@ async function saveShopLoadout(playFabId, loadout) {
       CosmeticHair: String(loadout?.hair ?? ""),
       CosmeticHairColor: String(loadout?.hairColor ?? ""),
       CosmeticMiscellaneous: JSON.stringify(Array.isArray(loadout?.miscellaneous) ? loadout.miscellaneous.slice(0, 16) : []),
-      CosmeticRevision: String(revision)
+      CosmeticRevision: String(revision),
+      EmoteWheel: JSON.stringify(normalizeEmoteWheel(loadout?.emoteWheel)),
+      VictoryEmote: String(loadout?.victoryEmote ?? ""),
+      EmoteRevision: String(emoteRevision)
     }
   });
-  return { ...loadout, revision };
+  return { ...loadout, revision, emoteRevision, emoteWheel: normalizeEmoteWheel(loadout?.emoteWheel) };
 }
 
 function shopResponse(playFabId, inventory, loadout, message) {
@@ -587,9 +611,13 @@ function shopResponse(playFabId, inventory, loadout, message) {
     hair: loadout.hair || "",
     hairColor: loadout.hairColor || "",
     miscellaneous: Array.isArray(loadout.miscellaneous) ? loadout.miscellaneous : [],
-    rev: loadout.revision || 0
+    rev: loadout.revision || 0,
+    ownedEmotes: Array.isArray(inventory.ownedEmotes) ? inventory.ownedEmotes : [],
+    emoteWheel: normalizeEmoteWheel(loadout.emoteWheel, inventory.ownedEmotes),
+    victoryEmote: inventory.ownedEmotes?.includes(loadout.victoryEmote) ? loadout.victoryEmote : "",
+    emoteRev: loadout.emoteRevision || 0
   }).token;
-  return { ok: true, message, crowns: inventory.crowns, owned: inventory.owned, hat: loadout.hat || "", shirt: loadout.shirt || "", pants: loadout.pants || "", shoes: loadout.shoes || "", hair: loadout.hair || "", hairColor: loadout.hairColor || "", miscellaneous: Array.isArray(loadout.miscellaneous) ? loadout.miscellaneous : [], revision: loadout.revision || 0, receipt };
+  return { ok: true, message, crowns: inventory.crowns, owned: inventory.owned, ownedEmotes: Array.isArray(inventory.ownedEmotes) ? inventory.ownedEmotes : [], hat: loadout.hat || "", shirt: loadout.shirt || "", pants: loadout.pants || "", shoes: loadout.shoes || "", hair: loadout.hair || "", hairColor: loadout.hairColor || "", miscellaneous: Array.isArray(loadout.miscellaneous) ? loadout.miscellaneous : [], revision: loadout.revision || 0, emoteWheel: normalizeEmoteWheel(loadout.emoteWheel, inventory.ownedEmotes), victoryEmote: inventory.ownedEmotes?.includes(loadout.victoryEmote) ? loadout.victoryEmote : "", emoteRevision: loadout.emoteRevision || 0, receipt };
 }
 
 async function getArcadeProgress(playFabId) {
@@ -1156,12 +1184,13 @@ app.post("/shop/purchase", async (req, res) => {
     await refreshShopCatalog();
     const itemId = String(req.body?.itemId ?? "").trim();
     const definition = SHOP_ITEMS.get(itemId);
-    if (!definition) return res.status(404).json({ ok: false, error: "That cosmetic is not available." });
+    if (!definition) return res.status(404).json({ ok: false, error: "That shop item is not available." });
     const before = await getShopInventory(playFabId);
-    const decision = purchaseDecision(before.crowns, definition.price, before.owned.includes(itemId));
+    const ownedList = definition.kind === "emote" ? before.ownedEmotes : before.owned;
+    const decision = purchaseDecision(before.crowns, definition.price, ownedList.includes(itemId));
     if (decision.alreadyOwned) {
       const loadout = await getShopLoadout(playFabId);
-      return res.json(shopResponse(playFabId, before, loadout, "You already own this cosmetic."));
+      return res.json(shopResponse(playFabId, before, loadout, `You already own this ${definition.kind === "emote" ? "emote" : "cosmetic"}.`));
     }
     if (!decision.ok) return res.status(409).json({ ok: false, error: "Not enough crowns." });
 
@@ -1218,6 +1247,35 @@ app.post("/shop/equip", async (req, res) => {
   }
 });
 
+app.post("/shop/emote/equip", async (req, res) => {
+  if (!requirePlayFabConfigured(res)) return;
+  try {
+    const playFabId = await authenticateShopRequest(req, res);
+    if (!playFabId) return;
+    const itemId = String(req.body?.itemId ?? "").trim();
+    const inventory = await getShopInventory(playFabId);
+    const loadout = await getShopLoadout(playFabId);
+
+    if (req.body?.victory === true) {
+      const selection = validateVictoryEmote(itemId, inventory.ownedEmotes);
+      if (!selection.ok) return res.status(403).json({ ok: false, error: "Purchase this emote before selecting it." });
+      loadout.victoryEmote = selection.itemId;
+      const saved = await saveShopLoadout(playFabId, loadout);
+      return res.json(shopResponse(playFabId, inventory, saved, selection.itemId ? "Victory emote updated." : "Victory emote cleared."));
+    }
+
+    const update = updateEmoteWheelSlot(loadout.emoteWheel, req.body?.wheelSlot, itemId, inventory.ownedEmotes);
+    if (!update.ok) return res.status(update.error === "not-owned" ? 403 : 400).json({ ok: false, error: update.error === "not-owned" ? "Purchase this emote before adding it to the wheel." : "Choose a valid emote wheel slot." });
+    loadout.emoteWheel = update.wheel;
+    const saved = await saveShopLoadout(playFabId, loadout);
+    return res.json(shopResponse(playFabId, inventory, saved, itemId ? "Emote wheel updated." : "Emote wheel slot cleared."));
+  } catch (error) {
+    const status = error.status === 401 ? 401 : 500;
+    console.warn(`[shop] Emote equip failed: ${error.message}`);
+    return res.status(status).json({ ok: false, error: status === 401 ? "Invalid PlayFab session ticket" : "Could not update emotes." });
+  }
+});
+
 app.post("/shop/spend", async (req, res) => {
   if (!requirePlayFabConfigured(res)) return;
   try {
@@ -1249,10 +1307,11 @@ app.post("/shop/admin/catalog", async (req, res) => {
     SHOP_ITEMS.clear();
     for (const item of catalog) {
       const custom = JSON.parse(item.CustomData);
-      SHOP_ITEMS.set(item.ItemId, { displayName: item.DisplayName, slot: custom.slot, price: item.VirtualCurrencyPrices[SHOP_CURRENCY_CODE] });
+      const kind = custom.kind === "emote" ? "emote" : "cosmetic";
+      SHOP_ITEMS.set(item.ItemId, { displayName: item.DisplayName, kind, slot: custom.slot, price: item.VirtualCurrencyPrices[SHOP_CURRENCY_CODE] });
     }
     shopCatalogLastRefresh = Date.now();
-    return res.json({ ok: true, message: `Published ${catalog.length} cosmetics to PlayFab catalog ${SHOP_CATALOG_VERSION}.` });
+    return res.json({ ok: true, message: `Published ${catalog.length} shop item(s) to PlayFab catalog ${SHOP_CATALOG_VERSION}.` });
   } catch (error) {
     console.warn(`[shop] Catalog publish failed: ${error.message}`);
     return res.status(400).json({ ok: false, error: error.message });
