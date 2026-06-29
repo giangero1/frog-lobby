@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mergeArcadeProgress, normalizeArcadeProgress, normalizeCatalogItem, normalizeEmoteWheel, normalizeHexColor, purchaseDecision, updateEmoteWheelSlot, updateMiscellaneousSelection, validateEquipSelection, validateVictoryEmote } from "./shopLogic.js";
+import { arcadePurchaseRewardDecision, mergeArcadeProgress, normalizeArcadeProgress, normalizeArcadeRewardState, normalizeCatalogItem, normalizeEmoteWheel, normalizeHexColor, purchaseDecision, updateEmoteWheelSlot, updateMiscellaneousSelection, validateEquipSelection, validateVictoryEmote } from "./shopLogic.js";
 
 test("purchase rejects insufficient balance and accepts owned idempotently", () => {
   assert.equal(purchaseDecision(4, 5, false).error, "insufficient-crowns");
@@ -91,5 +91,48 @@ test("arcade progress merge keeps highest values and union ownership", () => {
     ownedSkins: ["green", "red"],
     selectedSkin: "red",
     upgradeLevels: { engine: 2, fuel: 1 }
+  });
+});
+
+test("arcade purchase rewards grant skins once", () => {
+  const first = arcadePurchaseRewardDecision({}, { itemType: "skin", itemId: "americafirsthat" });
+  assert.equal(first.ok, true);
+  assert.equal(first.crownsAwarded, 2);
+  assert.deepEqual(first.state.rewardedSkins, ["americafirsthat"]);
+
+  const duplicate = arcadePurchaseRewardDecision(first.state, { itemType: "skin", itemId: "americafirsthat" });
+  assert.equal(duplicate.ok, true);
+  assert.equal(duplicate.crownsAwarded, 0);
+});
+
+test("arcade purchase rewards grant each upgrade level once in order", () => {
+  const levelOne = arcadePurchaseRewardDecision({}, { itemType: "upgrade", itemId: "engine", level: 1 });
+  assert.equal(levelOne.ok, true);
+  assert.equal(levelOne.crownsAwarded, 2);
+  assert.deepEqual(levelOne.state.rewardedUpgradeLevels, { engine: 1 });
+
+  const duplicate = arcadePurchaseRewardDecision(levelOne.state, { itemType: "upgrade", itemId: "engine", level: 1 });
+  assert.equal(duplicate.ok, true);
+  assert.equal(duplicate.crownsAwarded, 0);
+
+  const levelTwo = arcadePurchaseRewardDecision(levelOne.state, { itemType: "upgrade", itemId: "engine", level: 2 });
+  assert.equal(levelTwo.ok, true);
+  assert.equal(levelTwo.crownsAwarded, 2);
+  assert.deepEqual(levelTwo.state.rewardedUpgradeLevels, { engine: 2 });
+});
+
+test("arcade purchase rewards reject unknown items and invalid upgrade jumps", () => {
+  assert.equal(arcadePurchaseRewardDecision({}, { itemType: "skin", itemId: "unknown" }).error, "unknown-arcade-item");
+  assert.equal(arcadePurchaseRewardDecision({}, { itemType: "upgrade", itemId: "engine", level: 6 }).error, "invalid-upgrade-level");
+  assert.equal(arcadePurchaseRewardDecision({}, { itemType: "upgrade", itemId: "engine", level: 2 }).error, "invalid-upgrade-level");
+});
+
+test("arcade reward state normalizes unsafe data", () => {
+  assert.deepEqual(normalizeArcadeRewardState({
+    rewardedSkins: ["crown", "../bad", "crown"],
+    rewardedUpgradeLevels: { engine: 3, fueltank: 99, "../bad": 4 }
+  }), {
+    rewardedSkins: ["crown"],
+    rewardedUpgradeLevels: { engine: 3, fueltank: 5 }
   });
 });

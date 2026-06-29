@@ -1,5 +1,13 @@
 export const SHOP_SLOTS = new Set(["hat", "shirt", "pants", "shoes", "hair", "miscellaneous"]);
 export const SHOP_KINDS = new Set(["cosmetic", "emote"]);
+export const ARCADE_PURCHASE_REWARD_CROWNS = 2;
+export const ARCADE_REWARD_SKIN_IDS = new Set(["americafirsthat", "shtreimel", "crusader-helmet", "crown"]);
+export const ARCADE_REWARD_UPGRADE_MAX_LEVELS = new Map([
+  ["thruster", 5],
+  ["jetpack", 5],
+  ["engine", 5],
+  ["fueltank", 5]
+]);
 
 export function purchaseDecision(balance, price, alreadyOwned) {
   if (alreadyOwned) return { ok: true, alreadyOwned: true };
@@ -135,6 +143,57 @@ export function mergeArcadeProgress(existing, incoming, allowedItemIds = null) {
     upgradeLevels,
     selectedSkin
   };
+}
+
+export function normalizeArcadeRewardState(raw) {
+  const rewardedSkins = normalizeArcadeItemList(raw?.rewardedSkins ?? raw?.skins, ARCADE_REWARD_SKIN_IDS);
+  const rewardedUpgradeLevels = {};
+  const source = raw?.rewardedUpgradeLevels ?? raw?.upgradeLevels;
+  if (source && typeof source === "object") {
+    for (const [key, value] of Object.entries(source)) {
+      const itemId = normalizeArcadeItemId(key, new Set(ARCADE_REWARD_UPGRADE_MAX_LEVELS.keys()));
+      if (!itemId) continue;
+      const maxLevel = ARCADE_REWARD_UPGRADE_MAX_LEVELS.get(itemId) ?? 0;
+      const level = clampInt(value, 0, maxLevel);
+      if (level > 0) rewardedUpgradeLevels[itemId] = level;
+    }
+  }
+
+  return {
+    rewardedSkins,
+    rewardedUpgradeLevels
+  };
+}
+
+export function arcadePurchaseRewardDecision(currentState, rawRequest) {
+  const state = normalizeArcadeRewardState(currentState);
+  const itemId = normalizeArcadeItemId(rawRequest?.itemId, null);
+  const itemType = String(rawRequest?.itemType ?? rawRequest?.type ?? "").trim().toLowerCase();
+
+  if (itemType === "skin") {
+    if (!ARCADE_REWARD_SKIN_IDS.has(itemId)) return { ok: false, error: "unknown-arcade-item" };
+    if (state.rewardedSkins.includes(itemId))
+      return { ok: true, alreadyRewarded: true, crownsAwarded: 0, state };
+
+    state.rewardedSkins = [...state.rewardedSkins, itemId].sort();
+    return { ok: true, alreadyRewarded: false, crownsAwarded: ARCADE_PURCHASE_REWARD_CROWNS, state };
+  }
+
+  if (itemType === "upgrade") {
+    if (!ARCADE_REWARD_UPGRADE_MAX_LEVELS.has(itemId)) return { ok: false, error: "unknown-arcade-item" };
+    const maxLevel = ARCADE_REWARD_UPGRADE_MAX_LEVELS.get(itemId);
+    const level = clampInt(rawRequest?.level, -1, maxLevel);
+    const previousLevel = state.rewardedUpgradeLevels[itemId] ?? 0;
+    if (level >= 1 && level <= previousLevel)
+      return { ok: true, alreadyRewarded: true, crownsAwarded: 0, state };
+    if (level < 1 || level > maxLevel || level !== previousLevel + 1)
+      return { ok: false, error: "invalid-upgrade-level" };
+
+    state.rewardedUpgradeLevels[itemId] = level;
+    return { ok: true, alreadyRewarded: false, crownsAwarded: ARCADE_PURCHASE_REWARD_CROWNS, state };
+  }
+
+  return { ok: false, error: "unknown-arcade-item-type" };
 }
 
 function normalizeArcadeItemList(value, allowed) {

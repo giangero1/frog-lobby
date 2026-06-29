@@ -1,7 +1,7 @@
 import express from "express";
 import cors from "cors";
 import crypto from "crypto";
-import { mergeArcadeProgress, normalizeArcadeProgress, normalizeCatalogItem, normalizeEmoteWheel, normalizeHexColor, purchaseDecision, SHOP_SLOTS, updateEmoteWheelSlot, updateMiscellaneousSelection, validateEquipSelection, validateVictoryEmote } from "./shopLogic.js";
+import { arcadePurchaseRewardDecision, mergeArcadeProgress, normalizeArcadeProgress, normalizeArcadeRewardState, normalizeCatalogItem, normalizeEmoteWheel, normalizeHexColor, purchaseDecision, SHOP_SLOTS, updateEmoteWheelSlot, updateMiscellaneousSelection, validateEquipSelection, validateVictoryEmote } from "./shopLogic.js";
 import {
   registerItchOwnershipRoutes,
   requireFrogSession,
@@ -28,14 +28,13 @@ const SHOP_CATALOG_VERSION = (process.env.SHOP_CATALOG_VERSION ?? "Cosmetics").t
 const SHOP_ADMIN_TOKEN = (process.env.SHOP_ADMIN_TOKEN ?? "").trim();
 const ACCOUNT_LINK_HMAC_SECRET = (process.env.ACCOUNT_LINK_HMAC_SECRET ?? process.env.FROGWARS_ACCOUNT_LINK_HMAC_SECRET ?? PLAYFAB_SECRET_KEY).trim();
 const ARCADE_PROGRESS_KEY = "ArcadeProgressJson";
+const ARCADE_PURCHASE_REWARD_KEY = "ArcadePurchaseRewardsJson";
 const SHOP_ITEMS = new Map([
   ["america-first-hat", { displayName: "America First Hat", kind: "cosmetic", slot: "hat", price: 5 }],
   ["shtreimel", { displayName: "Shtreimel", kind: "cosmetic", slot: "hat", price: 8 }],
   ["crusader-helmet", { displayName: "Crusader Helmet", kind: "cosmetic", slot: "hat", price: 12 }],
   ["king-crown", { displayName: "King Crown", kind: "cosmetic", slot: "hat", price: 20 }],
-  ["charlie-chaplin-mustache", { displayName: "Charlie Chaplin Mustache", kind: "cosmetic", slot: "miscellaneous", price: 16 }],
-  ["wave", { displayName: "Wave", kind: "emote", price: 0 }],
-  ["cheer", { displayName: "Cheer", kind: "emote", price: 100 }]
+  ["charlie-chaplin-mustache", { displayName: "Charlie Chaplin Mustache", kind: "cosmetic", slot: "miscellaneous", price: 16 }]
 ]);
 let shopCatalogLastRefresh = 0;
 const ARCADE_RUN_TTL_MS = Math.max(60_000, Number.parseInt(process.env.ARCADE_RUN_TTL_SECONDS ?? "1800", 10) * 1000 || 1_800_000);
@@ -637,6 +636,23 @@ async function saveArcadeProgress(playFabId, progress) {
   return normalized;
 }
 
+async function getArcadePurchaseRewards(playFabId) {
+  const data = await getReadOnlyData(playFabId, [ARCADE_PURCHASE_REWARD_KEY]);
+  try {
+    return normalizeArcadeRewardState(JSON.parse(data[ARCADE_PURCHASE_REWARD_KEY] || "{}"));
+  } catch {
+    return normalizeArcadeRewardState({});
+  }
+}
+
+async function saveArcadePurchaseRewards(playFabId, rewards) {
+  const normalized = normalizeArcadeRewardState(rewards);
+  await updateReadOnlyData(playFabId, {
+    [ARCADE_PURCHASE_REWARD_KEY]: JSON.stringify(normalized)
+  });
+  return normalized;
+}
+
 function arcadeProgressForUnity(progress) {
   const normalized = normalizeArcadeProgress(progress);
   return {
@@ -1159,6 +1175,37 @@ app.post("/arcade/save", async (req, res) => {
     const status = error.status === 401 ? 401 : 500;
     console.warn(`[arcade] Save failed: ${error.message}`);
     return res.status(status).json({ ok: false, error: status === 401 ? "Invalid PlayFab session ticket" : "Could not save arcade progress" });
+  }
+});
+
+app.post("/arcade/purchase-reward", async (req, res) => {
+  if (!requirePlayFabConfigured(res)) return;
+  try {
+    const playFabId = await authenticatePlayFabSessionRequest(req, res);
+    if (!playFabId) return;
+    const currentRewards = await getArcadePurchaseRewards(playFabId);
+    const decision = arcadePurchaseRewardDecision(currentRewards, req.body);
+    if (!decision.ok) return res.status(400).json({ ok: false, error: "That arcade purchase is not eligible for a Frog Fashion crown reward." });
+
+    if (decision.crownsAwarded > 0) {
+      await addShopCrowns(playFabId, decision.crownsAwarded);
+      await saveArcadePurchaseRewards(playFabId, decision.state);
+    }
+
+    const [inventory, loadout] = await Promise.all([getShopInventory(playFabId), getShopLoadout(playFabId)]);
+    const response = shopResponse(
+      playFabId,
+      inventory,
+      loadout,
+      decision.crownsAwarded > 0
+        ? `You earned +${decision.crownsAwarded} Frog Fashion Crowns.`
+        : "This arcade purchase already paid its Frog Fashion crown reward.");
+    response.crownsAwarded = decision.crownsAwarded;
+    return res.json(response);
+  } catch (error) {
+    const status = error.status === 401 ? 401 : 500;
+    console.warn(`[arcade] Purchase reward failed: ${error.message}`);
+    return res.status(status).json({ ok: false, error: status === 401 ? "Invalid PlayFab session ticket" : "Could not claim the arcade purchase crown reward" });
   }
 });
 
