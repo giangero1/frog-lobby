@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { arcadePurchaseRewardDecision, mergeArcadeProgress, normalizeArcadeProgress, normalizeArcadeRewardState, normalizeCatalogItem, normalizeEmoteWheel, normalizeHexColor, purchaseDecision, updateEmoteWheelSlot, updateMiscellaneousSelection, validateEquipSelection, validateVictoryEmote } from "./shopLogic.js";
+import { arcadePurchaseRewardDecision, catalogPublishMismatches, mergeArcadeProgress, normalizeArcadeProgress, normalizeArcadeRewardState, normalizeCatalogItem, normalizeCatalogItems, normalizeEmoteWheel, normalizeHexColor, normalizePublishedCatalog, purchaseDecision, updateEmoteWheelSlot, updateMiscellaneousSelection, validateEquipSelection, validateVictoryEmote } from "./shopLogic.js";
 
 test("purchase rejects insufficient balance and accepts owned idempotently", () => {
   assert.equal(purchaseDecision(4, 5, false).error, "insufficient-crowns");
@@ -42,6 +42,40 @@ test("catalog publishing normalizes safe PlayFab entries", () => {
     CustomData: "{\"kind\":\"cosmetic\",\"slot\":\"hat\"}"
   });
   assert.throws(() => normalizeCatalogItem({ itemId: "bad", slot: "weapon", price: 1 }, "CR"));
+});
+
+test("catalog publishing rejects duplicate stable ids", () => {
+  assert.throws(() => normalizeCatalogItems([
+    { itemId: "shtreimel", displayName: "Shtreimel", slot: "hat", price: 8 },
+    { itemId: "shtreimel", displayName: "Duplicate", slot: "hat", price: 9 }
+  ], "CR"), /duplicate item id/i);
+});
+
+test("published catalog requires a valid CR price, kind, and slot", () => {
+  const live = normalizePublishedCatalog([{
+    ItemId: "shtreimel",
+    DisplayName: "Shtreimel",
+    VirtualCurrencyPrices: { CR: 8 },
+    CustomData: '{"kind":"cosmetic","slot":"hat"}'
+  }], "CR");
+  assert.deepEqual(live, [{ itemId: "shtreimel", displayName: "Shtreimel", kind: "cosmetic", slot: "hat", price: 8 }]);
+  assert.throws(() => normalizePublishedCatalog([{
+    ItemId: "bad-shoe",
+    VirtualCurrencyPrices: {},
+    CustomData: '{"kind":"cosmetic","slot":"shoes"}'
+  }], "CR"), /invalid kind or CR price/i);
+});
+
+test("catalog verification checks replacements exactly and updates without dropping existing items", () => {
+  const expected = normalizeCatalogItems([{ itemId: "shtreimel", displayName: "Shtreimel", slot: "hat", price: 8 }], "CR");
+  const actual = [
+    { itemId: "shtreimel", displayName: "Shtreimel", kind: "cosmetic", slot: "hat", price: 8 },
+    { itemId: "king-crown", displayName: "King Crown", kind: "cosmetic", slot: "hat", price: 20 }
+  ];
+  assert.deepEqual(catalogPublishMismatches(expected, actual, false, "CR"), []);
+  assert.match(catalogPublishMismatches(expected, actual, true, "CR")[0], /catalog count/i);
+  actual[0].price = 9;
+  assert.match(catalogPublishMismatches(expected, actual, false, "CR")[0], /expected cosmetic\/hat\/8/i);
 });
 
 test("emote wheel normalization and slot updates require owned emotes", () => {

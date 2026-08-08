@@ -91,6 +91,76 @@ export function normalizeCatalogItem(raw, currencyCode) {
   };
 }
 
+export function normalizeCatalogItems(rawItems, currencyCode) {
+  const seen = new Set();
+  return (Array.isArray(rawItems) ? rawItems : []).map(raw => {
+    const item = normalizeCatalogItem(raw, currencyCode);
+    if (seen.has(item.ItemId))
+      throw new Error(`Catalog contains duplicate item id '${item.ItemId}'.`);
+    seen.add(item.ItemId);
+    return item;
+  });
+}
+
+export function normalizePublishedCatalog(entries, currencyCode) {
+  const seen = new Set();
+  return (Array.isArray(entries) ? entries : []).map(entry => {
+    const itemId = String(entry?.ItemId ?? "").trim();
+    if (!itemId)
+      throw new Error("Published catalog contains an item without an id.");
+    if (seen.has(itemId))
+      throw new Error(`Published catalog contains duplicate item id '${itemId}'.`);
+    seen.add(itemId);
+
+    let custom;
+    try {
+      custom = JSON.parse(entry?.CustomData ?? "{}");
+    } catch {
+      throw new Error(`Published catalog item '${itemId}' has invalid custom data.`);
+    }
+
+    const kind = String(custom?.kind ?? (custom?.slot ? "cosmetic" : "emote")).trim().toLowerCase();
+    const slot = String(custom?.slot ?? "").trim().toLowerCase();
+    const rawPrice = entry?.VirtualCurrencyPrices?.[currencyCode];
+    const price = Number.isInteger(rawPrice) ? rawPrice : Number.parseInt(rawPrice, 10);
+    if (!SHOP_KINDS.has(kind) || !Number.isInteger(price) || price < 0)
+      throw new Error(`Published catalog item '${itemId}' has an invalid kind or ${currencyCode} price.`);
+    if (kind === "cosmetic" && !SHOP_SLOTS.has(slot))
+      throw new Error(`Published catalog item '${itemId}' has invalid slot '${slot}'.`);
+
+    return {
+      itemId,
+      displayName: String(entry?.DisplayName ?? itemId),
+      kind,
+      slot: kind === "cosmetic" ? slot : undefined,
+      price
+    };
+  });
+}
+
+export function catalogPublishMismatches(expectedCatalog, actualDefinitions, requireExact = false, currencyCode = "CR") {
+  const actualById = new Map((Array.isArray(actualDefinitions) ? actualDefinitions : []).map(item => [item.itemId, item]));
+  const mismatches = [];
+  for (const expected of Array.isArray(expectedCatalog) ? expectedCatalog : []) {
+    const itemId = expected.ItemId;
+    const actual = actualById.get(itemId);
+    let custom = {};
+    try { custom = JSON.parse(expected.CustomData ?? "{}"); } catch { custom = {}; }
+    const expectedKind = custom.kind === "emote" ? "emote" : "cosmetic";
+    const expectedSlot = expectedKind === "cosmetic" ? String(custom.slot ?? "") : undefined;
+    const expectedPrice = expected.VirtualCurrencyPrices?.[currencyCode];
+    if (!actual) {
+      mismatches.push(`${itemId}: missing`);
+      continue;
+    }
+    if (actual.kind !== expectedKind || actual.slot !== expectedSlot || actual.price !== expectedPrice)
+      mismatches.push(`${itemId}: expected ${expectedKind}/${expectedSlot ?? "-"}/${expectedPrice}, got ${actual.kind}/${actual.slot ?? "-"}/${actual.price}`);
+  }
+  if (requireExact && actualById.size !== (Array.isArray(expectedCatalog) ? expectedCatalog.length : 0))
+    mismatches.push(`catalog count: expected ${expectedCatalog.length}, got ${actualById.size}`);
+  return mismatches;
+}
+
 export function normalizeArcadeProgress(raw, allowedItemIds = null) {
   const allowed = allowedItemIds instanceof Set ? allowedItemIds : null;
   const coinBalance = clampInt(raw?.coinBalance, 0, 999999999);

@@ -1,7 +1,9 @@
 import express from "express";
 import cors from "cors";
 import crypto from "crypto";
-import { arcadePurchaseRewardDecision, mergeArcadeProgress, normalizeArcadeProgress, normalizeArcadeRewardState, normalizeCatalogItem, normalizeEmoteWheel, normalizeHexColor, purchaseDecision, SHOP_SLOTS, updateEmoteWheelSlot, updateMiscellaneousSelection, validateEquipSelection, validateVictoryEmote } from "./shopLogic.js";
+import { arcadePurchaseRewardDecision, catalogPublishMismatches, mergeArcadeProgress, normalizeArcadeProgress, normalizeArcadeRewardState, normalizeCatalogItems, normalizeEmoteWheel, normalizeHexColor, normalizePublishedCatalog, SHOP_SLOTS, updateEmoteWheelSlot, updateMiscellaneousSelection, validateEquipSelection, validateVictoryEmote } from "./shopLogic.js";
+import { createPlayFabApi } from "./playFabApi.js";
+import { classifyPlayFabPurchaseError, createKeyedSerialExecutor, executeShopPurchase } from "./shopPurchase.js";
 import {
   registerItchOwnershipRoutes,
   requireFrogSession,
@@ -26,6 +28,8 @@ const PLAYFAB_API_BASE = PLAYFAB_TITLE_ID ? `https://${PLAYFAB_TITLE_ID}.playfab
 const SHOP_CURRENCY_CODE = (process.env.SHOP_CURRENCY_CODE ?? "CR").trim().toUpperCase();
 const SHOP_CATALOG_VERSION = (process.env.SHOP_CATALOG_VERSION ?? "Cosmetics").trim();
 const SHOP_ADMIN_TOKEN = (process.env.SHOP_ADMIN_TOKEN ?? "").trim();
+const playFabApi = createPlayFabApi({ apiBase: PLAYFAB_API_BASE, secretKey: PLAYFAB_SECRET_KEY });
+const runPurchaseExclusive = createKeyedSerialExecutor();
 const ACCOUNT_LINK_HMAC_SECRET = (process.env.ACCOUNT_LINK_HMAC_SECRET ?? process.env.FROGWARS_ACCOUNT_LINK_HMAC_SECRET ?? PLAYFAB_SECRET_KEY).trim();
 const ARCADE_PROGRESS_KEY = "ArcadeProgressJson";
 const ARCADE_PURCHASE_REWARD_KEY = "ArcadePurchaseRewardsJson";
@@ -344,34 +348,11 @@ function sanitizeDisplayName(value) {
 }
 
 async function playFabServerRequest(path, body) {
-  const response = await fetch(`${PLAYFAB_API_BASE}${path}`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-secretkey": PLAYFAB_SECRET_KEY
-    },
-    body: JSON.stringify(body ?? {})
-  });
+  return playFabApi.serverRequest(path, body);
+}
 
-  const text = await response.text();
-  let parsed = null;
-  if (text) {
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      parsed = { raw: text };
-    }
-  }
-
-  if (!response.ok || parsed?.code === 400 || parsed?.error) {
-    const message = parsed?.errorMessage ?? parsed?.error ?? `PlayFab request failed with HTTP ${response.status}`;
-    const error = new Error(message);
-    error.status = response.status;
-    error.playFab = parsed;
-    throw error;
-  }
-
-  return parsed?.data ?? parsed ?? {};
+async function playFabClientRequest(path, body, sessionTicket) {
+  return playFabApi.clientRequest(path, body, sessionTicket);
 }
 
 async function authenticateSessionTicket(sessionTicket) {
@@ -388,7 +369,10 @@ async function authenticateSessionTicket(sessionTicket) {
       SessionTicket: ticket
     });
   } catch (error) {
-    error.status = 401;
+    const playFabCode = String(error?.playFab?.error ?? "");
+    const invalidSession = error?.status === 401 || error?.status === 403 ||
+      ["AuthenticationContextMissing", "InvalidSessionTicket", "NotAuthenticated", "SessionTicketExpired"].includes(playFabCode);
+    error.status = invalidSession ? 401 : 502;
     throw error;
   }
 
@@ -530,22 +514,31 @@ async function refreshShopCatalog(force = false) {
   if (!force && Date.now() - shopCatalogLastRefresh < 60_000) return SHOP_ITEMS;
   const data = await playFabServerRequest("/Server/GetCatalogItems", { CatalogVersion: SHOP_CATALOG_VERSION });
   const entries = Array.isArray(data?.Catalog) ? data.Catalog : [];
-  if (entries.length > 0) {
-    SHOP_ITEMS.clear();
-    for (const entry of entries) {
-      const itemId = String(entry?.ItemId ?? "").trim();
-      let custom = {};
-      try { custom = JSON.parse(entry?.CustomData ?? "{}"); } catch { custom = {}; }
-      const kind = String(custom?.kind ?? (custom?.slot ? "cosmetic" : "emote")).trim().toLowerCase();
-      const slot = String(custom?.slot ?? "hat").trim().toLowerCase();
-      const rawPrice = entry?.VirtualCurrencyPrices?.[SHOP_CURRENCY_CODE];
-      if (!itemId) continue;
-      if (kind === "emote") SHOP_ITEMS.set(itemId, { displayName: String(entry?.DisplayName ?? itemId), kind: "emote", price: parseNonNegativeInteger(rawPrice, 0) });
-      else if (SHOP_SLOTS.has(slot)) SHOP_ITEMS.set(itemId, { displayName: String(entry?.DisplayName ?? itemId), kind: "cosmetic", slot, price: parseNonNegativeInteger(rawPrice, 0) });
-    }
-  }
+  const definitions = normalizePublishedCatalog(entries, SHOP_CURRENCY_CODE);
+  SHOP_ITEMS.clear();
+  for (const definition of definitions)
+    SHOP_ITEMS.set(definition.itemId, { displayName: definition.displayName, kind: definition.kind, slot: definition.slot, price: definition.price });
   shopCatalogLastRefresh = Date.now();
   return SHOP_ITEMS;
+}
+
+function currentShopCatalogDefinitions() {
+  return [...SHOP_ITEMS.entries()].map(([itemId, definition]) => ({ itemId, ...definition }));
+}
+
+async function refreshAndVerifyPublishedCatalog(expectedCatalog, replace) {
+  const retryDelaysMs = [0, 250, 750];
+  let mismatches = [];
+  for (const delayMs of retryDelaysMs) {
+    if (delayMs > 0)
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+    shopCatalogLastRefresh = 0;
+    await refreshShopCatalog(true);
+    mismatches = catalogPublishMismatches(expectedCatalog, currentShopCatalogDefinitions(), replace, SHOP_CURRENCY_CODE);
+    if (mismatches.length === 0)
+      return currentShopCatalogDefinitions();
+  }
+  throw new Error(`PlayFab catalog verification failed: ${mismatches.slice(0, 8).join("; ")}`);
 }
 
 async function getShopLoadout(playFabId) {
@@ -1225,35 +1218,32 @@ app.post("/shop/profile", async (req, res) => {
 
 app.post("/shop/purchase", async (req, res) => {
   if (!requirePlayFabConfigured(res)) return;
+  const itemId = String(req.body?.itemId ?? "").trim();
   try {
     const playFabId = await authenticateShopRequest(req, res);
     if (!playFabId) return;
-    await refreshShopCatalog();
-    const itemId = String(req.body?.itemId ?? "").trim();
-    const definition = SHOP_ITEMS.get(itemId);
-    if (!definition) return res.status(404).json({ ok: false, error: "That shop item is not available." });
-    const before = await getShopInventory(playFabId);
-    const ownedList = definition.kind === "emote" ? before.ownedEmotes : before.owned;
-    const decision = purchaseDecision(before.crowns, definition.price, ownedList.includes(itemId));
-    if (decision.alreadyOwned) {
-      const loadout = await getShopLoadout(playFabId);
-      return res.json(shopResponse(playFabId, before, loadout, `You already own this ${definition.kind === "emote" ? "emote" : "cosmetic"}.`));
-    }
-    if (!decision.ok) return res.status(409).json({ ok: false, error: "Not enough crowns." });
-
-    await playFabServerRequest("/Server/PurchaseItem", {
-      PlayFabId: playFabId,
-      CatalogVersion: SHOP_CATALOG_VERSION,
-      ItemId: itemId,
-      Price: definition.price,
-      VirtualCurrency: SHOP_CURRENCY_CODE
+    const response = await runPurchaseExclusive(playFabId, async () => {
+      await refreshShopCatalog();
+      const definition = SHOP_ITEMS.get(itemId);
+      return executeShopPurchase({
+        playFabId,
+        sessionTicket: req.body?.sessionTicket,
+        itemId,
+        definition,
+        currencyCode: SHOP_CURRENCY_CODE,
+        catalogVersion: SHOP_CATALOG_VERSION,
+        getInventory: getShopInventory,
+        getLoadout: getShopLoadout,
+        purchaseItem: (sessionTicket, body) => playFabClientRequest("/Client/PurchaseItem", body, sessionTicket),
+        buildResponse: shopResponse
+      });
     });
-    const [inventory, loadout] = await Promise.all([getShopInventory(playFabId), getShopLoadout(playFabId)]);
-    return res.json(shopResponse(playFabId, inventory, loadout, `${definition.displayName} purchased.`));
+    return res.json(response);
   } catch (error) {
-    const status = error.status === 401 ? 401 : 409;
-    console.warn(`[shop] Purchase failed: ${error.message}`);
-    return res.status(status).json({ ok: false, error: status === 401 ? "Invalid PlayFab session ticket" : "Purchase was declined by the crown vault." });
+    const failure = classifyPlayFabPurchaseError(error);
+    const playFabCode = String(error?.playFab?.error ?? error?.cause?.playFab?.error ?? "unknown");
+    console.warn(`[shop] Purchase failed item=${itemId || "<empty>"} code=${playFabCode} status=${failure.status}: ${error.message}`);
+    return res.status(failure.status).json({ ok: false, code: failure.code, error: failure.message });
   }
 });
 
@@ -1348,17 +1338,20 @@ app.post("/shop/admin/catalog", async (req, res) => {
   if (!SHOP_ADMIN_TOKEN || provided.length !== SHOP_ADMIN_TOKEN.length || !crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(SHOP_ADMIN_TOKEN)))
     return res.status(403).json({ ok: false, error: "Invalid shop administrator token." });
   try {
-    const incoming = Array.isArray(req.body?.items) ? req.body.items : [];
-    const catalog = incoming.map(raw => normalizeCatalogItem(raw, SHOP_CURRENCY_CODE));
-    await playFabServerRequest("/Admin/UpdateCatalogItems", { CatalogVersion: SHOP_CATALOG_VERSION, Catalog: catalog, SetAsDefaultCatalog: false });
-    SHOP_ITEMS.clear();
-    for (const item of catalog) {
-      const custom = JSON.parse(item.CustomData);
-      const kind = custom.kind === "emote" ? "emote" : "cosmetic";
-      SHOP_ITEMS.set(item.ItemId, { displayName: item.DisplayName, kind, slot: custom.slot, price: item.VirtualCurrencyPrices[SHOP_CURRENCY_CODE] });
-    }
-    shopCatalogLastRefresh = Date.now();
-    return res.json({ ok: true, message: `Published ${catalog.length} shop item(s) to PlayFab catalog ${SHOP_CATALOG_VERSION}.` });
+    const incoming = Array.isArray(req.body?.items) ? req.body.items.filter(raw => raw?.available !== false) : [];
+    const catalog = normalizeCatalogItems(incoming, SHOP_CURRENCY_CODE);
+    const replace = req.body?.replace === true;
+    await playFabServerRequest(replace ? "/Admin/SetCatalogItems" : "/Admin/UpdateCatalogItems", { CatalogVersion: SHOP_CATALOG_VERSION, Catalog: catalog, SetAsDefaultCatalog: false });
+    const verifiedCatalog = await refreshAndVerifyPublishedCatalog(catalog, replace);
+    const action = replace ? "Replaced" : "Updated";
+    return res.json({
+      ok: true,
+      message: `${action} PlayFab catalog ${SHOP_CATALOG_VERSION}; verified ${catalog.length} submitted item(s) against ${verifiedCatalog.length} live item(s).`,
+      replace,
+      submittedCount: catalog.length,
+      liveCount: verifiedCatalog.length,
+      verifiedCount: catalog.length
+    });
   } catch (error) {
     console.warn(`[shop] Catalog publish failed: ${error.message}`);
     return res.status(400).json({ ok: false, error: error.message });
