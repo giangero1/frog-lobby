@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { arcadePurchaseRewardDecision, catalogPublishMismatches, mergeArcadeProgress, normalizeArcadeProgress, normalizeArcadeRewardState, normalizeCatalogItem, normalizeCatalogItems, normalizeEmoteWheel, normalizeHexColor, normalizePublishedCatalog, purchaseDecision, updateEmoteWheelSlot, updateMiscellaneousSelection, validateEquipSelection, validateVictoryEmote } from "./shopLogic.js";
+import { arcadePurchaseRewardDecision, buildCosmeticLoadoutUpdate, buildEmoteLoadoutUpdate, buildFullLoadoutUpdate, catalogPublishMismatches, mergeArcadeProgress, normalizeArcadeProgress, normalizeArcadeRewardState, normalizeCatalogItem, normalizeCatalogItems, normalizeEmoteWheel, normalizeHexColor, normalizePublishedCatalog, purchaseDecision, updateEmoteWheelSlot, updateMiscellaneousSelection, validateEquipSelection, validateVictoryEmote } from "./shopLogic.js";
 
 test("purchase rejects insufficient balance and accepts owned idempotently", () => {
   assert.equal(purchaseDecision(4, 5, false).error, "insufficient-crowns");
@@ -14,6 +14,30 @@ test("equip requires ownership and the matching slot", () => {
   assert.equal(validateEquipSelection("hat", "king-crown", definition, ["king-crown"]).ok, true);
   assert.equal(validateEquipSelection("hat", "", null, []).ok, true);
   assert.equal(validateEquipSelection("miscellaneous", "charlie-chaplin-mustache", { slot: "miscellaneous" }, ["charlie-chaplin-mustache"]).ok, true);
+});
+
+test("hat equip writes only the changed slot and cosmetic revision", () => {
+  assert.deepEqual(buildCosmeticLoadoutUpdate({ hat: "shtreimel" }, "hat", 123), {
+    Data: { CosmeticRevision: "123", CosmeticHat: "shtreimel" }
+  });
+});
+
+test("clearing a cosmetic uses KeysToRemove instead of an empty value", () => {
+  assert.deepEqual(buildCosmeticLoadoutUpdate({ hat: "" }, "hat", 124), {
+    Data: { CosmeticRevision: "124" },
+    KeysToRemove: ["CosmeticHat"]
+  });
+});
+
+test("cosmetic and emote writes remain isolated", () => {
+  assert.deepEqual(buildEmoteLoadoutUpdate({ victoryEmote: "dance" }, "victory", 200), {
+    Data: { EmoteRevision: "200", VictoryEmote: "dance" }
+  });
+  const full = buildFullLoadoutUpdate({ hat: "shtreimel", emoteWheel: ["wave"] }, 300, 301);
+  assert.equal(full.Data.CosmeticHat, "shtreimel");
+  assert.equal(full.Data.EmoteRevision, "301");
+  assert.ok(full.KeysToRemove.includes("VictoryEmote"));
+  assert.ok(!Object.values(full.Data).includes(""));
 });
 
 test("catalog accepts stackable miscellaneous cosmetics", () => {

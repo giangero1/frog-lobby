@@ -32,6 +32,72 @@ export function updateMiscellaneousSelection(current, itemId, equipped, limit = 
   return [...items].slice(0, limit);
 }
 
+const COSMETIC_DATA_KEYS = Object.freeze({
+  hat: "CosmeticHat",
+  shirt: "CosmeticShirt",
+  pants: "CosmeticPants",
+  shoes: "CosmeticShoes",
+  hair: "CosmeticHair",
+  haircolor: "CosmeticHairColor"
+});
+
+function appendOptionalString(update, key, value) {
+  const normalized = String(value ?? "").trim();
+  if (normalized) update.Data[key] = normalized;
+  else update.KeysToRemove.push(key);
+}
+
+function finalizePlayerDataUpdate(update) {
+  if (update.KeysToRemove.length === 0) delete update.KeysToRemove;
+  return update;
+}
+
+export function buildCosmeticLoadoutUpdate(loadout, slot, revision) {
+  const normalizedSlot = String(slot ?? "").trim().toLowerCase();
+  const update = { Data: { CosmeticRevision: String(revision) }, KeysToRemove: [] };
+  if (normalizedSlot === "miscellaneous") {
+    update.Data.CosmeticMiscellaneous = JSON.stringify(
+      Array.isArray(loadout?.miscellaneous) ? loadout.miscellaneous.slice(0, 16) : []
+    );
+  } else {
+    const key = COSMETIC_DATA_KEYS[normalizedSlot];
+    if (!key) throw new Error(`Unsupported cosmetic loadout slot: ${normalizedSlot || "<empty>"}`);
+    const property = normalizedSlot === "haircolor" ? "hairColor" : normalizedSlot;
+    appendOptionalString(update, key, loadout?.[property]);
+  }
+  return finalizePlayerDataUpdate(update);
+}
+
+export function buildEmoteLoadoutUpdate(loadout, field, revision) {
+  const normalizedField = String(field ?? "").trim().toLowerCase();
+  const update = { Data: { EmoteRevision: String(revision) }, KeysToRemove: [] };
+  if (normalizedField === "wheel")
+    update.Data.EmoteWheel = JSON.stringify(normalizeEmoteWheel(loadout?.emoteWheel));
+  else if (normalizedField === "victory")
+    appendOptionalString(update, "VictoryEmote", loadout?.victoryEmote);
+  else
+    throw new Error(`Unsupported emote loadout field: ${normalizedField || "<empty>"}`);
+  return finalizePlayerDataUpdate(update);
+}
+
+export function buildFullLoadoutUpdate(loadout, revision, emoteRevision) {
+  const update = {
+    Data: {
+      CosmeticMiscellaneous: JSON.stringify(Array.isArray(loadout?.miscellaneous) ? loadout.miscellaneous.slice(0, 16) : []),
+      CosmeticRevision: String(revision),
+      EmoteWheel: JSON.stringify(normalizeEmoteWheel(loadout?.emoteWheel)),
+      EmoteRevision: String(emoteRevision)
+    },
+    KeysToRemove: []
+  };
+  for (const [slot, key] of Object.entries(COSMETIC_DATA_KEYS)) {
+    const property = slot === "haircolor" ? "hairColor" : slot;
+    appendOptionalString(update, key, loadout?.[property]);
+  }
+  appendOptionalString(update, "VictoryEmote", loadout?.victoryEmote);
+  return finalizePlayerDataUpdate(update);
+}
+
 export function normalizeEmoteWheel(current, owned = null, limit = 8) {
   const ownedSet = Array.isArray(owned) ? new Set(owned.map(x => String(x).trim()).filter(Boolean)) : null;
   const source = Array.isArray(current) ? current : [];

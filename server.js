@@ -1,7 +1,7 @@
 import express from "express";
 import cors from "cors";
 import crypto from "crypto";
-import { arcadePurchaseRewardDecision, catalogPublishMismatches, mergeArcadeProgress, normalizeArcadeProgress, normalizeArcadeRewardState, normalizeCatalogItems, normalizeEmoteWheel, normalizeHexColor, normalizePublishedCatalog, SHOP_SLOTS, updateEmoteWheelSlot, updateMiscellaneousSelection, validateEquipSelection, validateVictoryEmote } from "./shopLogic.js";
+import { arcadePurchaseRewardDecision, buildCosmeticLoadoutUpdate, buildEmoteLoadoutUpdate, buildFullLoadoutUpdate, catalogPublishMismatches, mergeArcadeProgress, normalizeArcadeProgress, normalizeArcadeRewardState, normalizeCatalogItems, normalizeEmoteWheel, normalizeHexColor, normalizePublishedCatalog, SHOP_SLOTS, updateEmoteWheelSlot, updateMiscellaneousSelection, validateEquipSelection, validateVictoryEmote } from "./shopLogic.js";
 import { createPlayFabApi } from "./playFabApi.js";
 import { classifyPlayFabPurchaseError, createKeyedSerialExecutor, executeShopPurchase } from "./shopPurchase.js";
 import {
@@ -568,26 +568,32 @@ async function getShopLoadout(playFabId) {
   };
 }
 
-async function saveShopLoadout(playFabId, loadout) {
-  const revision = Math.max(Date.now(), parseNonNegativeInteger(loadout?.revision, 0) + 1);
-  const emoteRevision = Math.max(Date.now(), parseNonNegativeInteger(loadout?.emoteRevision, 0) + 1);
-  await playFabServerRequest("/Server/UpdateUserReadOnlyData", {
-    PlayFabId: playFabId,
-    Data: {
-      CosmeticHat: String(loadout?.hat ?? ""),
-      CosmeticShirt: String(loadout?.shirt ?? ""),
-      CosmeticPants: String(loadout?.pants ?? ""),
-      CosmeticShoes: String(loadout?.shoes ?? ""),
-      CosmeticHair: String(loadout?.hair ?? ""),
-      CosmeticHairColor: String(loadout?.hairColor ?? ""),
-      CosmeticMiscellaneous: JSON.stringify(Array.isArray(loadout?.miscellaneous) ? loadout.miscellaneous.slice(0, 16) : []),
-      CosmeticRevision: String(revision),
-      EmoteWheel: JSON.stringify(normalizeEmoteWheel(loadout?.emoteWheel)),
-      VictoryEmote: String(loadout?.victoryEmote ?? ""),
-      EmoteRevision: String(emoteRevision)
-    }
-  });
+async function saveShopLoadout(playFabId, loadout, scope = null) {
+  const savesCosmetics = !scope || Boolean(scope.cosmeticSlot);
+  const savesEmotes = !scope || Boolean(scope.emoteField);
+  const revision = savesCosmetics
+    ? Math.max(Date.now(), parseNonNegativeInteger(loadout?.revision, 0) + 1)
+    : parseNonNegativeInteger(loadout?.revision, 0);
+  const emoteRevision = savesEmotes
+    ? Math.max(Date.now(), parseNonNegativeInteger(loadout?.emoteRevision, 0) + 1)
+    : parseNonNegativeInteger(loadout?.emoteRevision, 0);
+  const update = scope?.cosmeticSlot
+    ? buildCosmeticLoadoutUpdate(loadout, scope.cosmeticSlot, revision)
+    : scope?.emoteField
+      ? buildEmoteLoadoutUpdate(loadout, scope.emoteField, emoteRevision)
+      : buildFullLoadoutUpdate(loadout, revision, emoteRevision);
+  await playFabServerRequest("/Server/UpdateUserReadOnlyData", { PlayFabId: playFabId, ...update });
   return { ...loadout, revision, emoteRevision, emoteWheel: normalizeEmoteWheel(loadout?.emoteWheel) };
+}
+
+function playFabFailureDetails(error) {
+  const playFab = error?.playFab ?? error?.cause?.playFab ?? null;
+  return JSON.stringify({
+    error: String(playFab?.error ?? "unknown"),
+    errorCode: playFab?.errorCode ?? null,
+    errorMessage: String(playFab?.errorMessage ?? error?.message ?? "Unknown PlayFab error"),
+    errorDetails: playFab?.errorDetails ?? null
+  });
 }
 
 function shopResponse(playFabId, inventory, loadout, message) {
@@ -1261,7 +1267,7 @@ app.post("/shop/equip", async (req, res) => {
     if (slot === "haircolor") {
       const loadout = await getShopLoadout(playFabId);
       loadout.hairColor = normalizeHexColor(itemId);
-      const saved = await saveShopLoadout(playFabId, loadout);
+      const saved = await saveShopLoadout(playFabId, loadout, { cosmeticSlot: "haircolor" });
       return res.json(shopResponse(playFabId, inventory, saved, loadout.hairColor ? "Hair color updated." : "Hair color reset."));
     }
 
@@ -1272,15 +1278,16 @@ app.post("/shop/equip", async (req, res) => {
       const equipped = req.body?.equipped !== false;
       loadout.miscellaneous = updateMiscellaneousSelection(loadout.miscellaneous, itemId, equipped);
     } else loadout[slot] = itemId;
-    const saved = await saveShopLoadout(playFabId, loadout);
+    const saved = await saveShopLoadout(playFabId, loadout, { cosmeticSlot: slot });
     const message = slot === "miscellaneous" && itemId && req.body?.equipped === false
       ? "Cosmetic unequipped."
       : itemId ? "Cosmetic equipped." : "Slot cleared.";
     return res.json(shopResponse(playFabId, inventory, saved, message));
   } catch (error) {
     const status = error.status === 401 ? 401 : 500;
-    console.warn(`[shop] Equip failed: ${error.message}`);
-    return res.status(status).json({ ok: false, error: status === 401 ? "Invalid PlayFab session ticket" : "Could not update the wardrobe." });
+    console.warn(`[shop] Equip failed stage=UpdateUserReadOnlyData details=${playFabFailureDetails(error)}`);
+    const code = String(error?.playFab?.error ?? "wardrobe-update-failed");
+    return res.status(status).json({ ok: false, code, error: status === 401 ? "Invalid PlayFab session ticket" : "Could not update the wardrobe." });
   }
 });
 
@@ -1297,18 +1304,18 @@ app.post("/shop/emote/equip", async (req, res) => {
       const selection = validateVictoryEmote(itemId, inventory.ownedEmotes);
       if (!selection.ok) return res.status(403).json({ ok: false, error: "Purchase this emote before selecting it." });
       loadout.victoryEmote = selection.itemId;
-      const saved = await saveShopLoadout(playFabId, loadout);
+      const saved = await saveShopLoadout(playFabId, loadout, { emoteField: "victory" });
       return res.json(shopResponse(playFabId, inventory, saved, selection.itemId ? "Victory emote updated." : "Victory emote cleared."));
     }
 
     const update = updateEmoteWheelSlot(loadout.emoteWheel, req.body?.wheelSlot, itemId, inventory.ownedEmotes);
     if (!update.ok) return res.status(update.error === "not-owned" ? 403 : 400).json({ ok: false, error: update.error === "not-owned" ? "Purchase this emote before adding it to the wheel." : "Choose a valid emote wheel slot." });
     loadout.emoteWheel = update.wheel;
-    const saved = await saveShopLoadout(playFabId, loadout);
+    const saved = await saveShopLoadout(playFabId, loadout, { emoteField: "wheel" });
     return res.json(shopResponse(playFabId, inventory, saved, itemId ? "Emote wheel updated." : "Emote wheel slot cleared."));
   } catch (error) {
     const status = error.status === 401 ? 401 : 500;
-    console.warn(`[shop] Emote equip failed: ${error.message}`);
+    console.warn(`[shop] Emote equip failed stage=UpdateUserReadOnlyData details=${playFabFailureDetails(error)}`);
     return res.status(status).json({ ok: false, error: status === 401 ? "Invalid PlayFab session ticket" : "Could not update emotes." });
   }
 });
