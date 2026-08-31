@@ -1,9 +1,10 @@
 import express from "express";
 import cors from "cors";
 import crypto from "crypto";
-import { arcadePurchaseRewardDecision, buildCosmeticLoadoutUpdate, buildEmoteLoadoutUpdate, buildFullLoadoutUpdate, catalogPublishMismatches, mergeArcadeProgress, normalizeArcadeProgress, normalizeArcadeRewardState, normalizeCatalogItems, normalizeEmoteWheel, normalizeHexColor, normalizePublishedCatalog, SHOP_SLOTS, updateEmoteWheelSlot, updateMiscellaneousSelection, validateEquipSelection, validateVictoryEmote } from "./shopLogic.js";
+import { arcadePurchaseRewardDecision, buildCosmeticLoadoutUpdate, buildEmoteLoadoutUpdate, buildFullLoadoutUpdate, buildLobbyGearUpdate, catalogPublishMismatches, mergeArcadeProgress, normalizeArcadeProgress, normalizeArcadeRewardState, normalizeCatalogItems, normalizeEmoteWheel, normalizeHexColor, normalizeLobbyGear, normalizePublishedCatalog, SHOP_SLOTS, updateEmoteWheelSlot, updateLobbyGearSlot, updateMiscellaneousSelection, validateEquipSelection, validateVictoryEmote } from "./shopLogic.js";
 import { createPlayFabApi } from "./playFabApi.js";
 import { classifyPlayFabPurchaseError, createKeyedSerialExecutor, executeShopPurchase } from "./shopPurchase.js";
+import { normalizeFishingState, resolveFishingRoll, startFishing, stopFishing } from "./fishingLogic.js";
 import {
   registerItchOwnershipRoutes,
   requireFrogSession,
@@ -30,15 +31,25 @@ const SHOP_CATALOG_VERSION = (process.env.SHOP_CATALOG_VERSION ?? "Cosmetics").t
 const SHOP_ADMIN_TOKEN = (process.env.SHOP_ADMIN_TOKEN ?? "").trim();
 const playFabApi = createPlayFabApi({ apiBase: PLAYFAB_API_BASE, secretKey: PLAYFAB_SECRET_KEY });
 const runPurchaseExclusive = createKeyedSerialExecutor();
+const runFishingExclusive = createKeyedSerialExecutor();
 const ACCOUNT_LINK_HMAC_SECRET = (process.env.ACCOUNT_LINK_HMAC_SECRET ?? process.env.FROGWARS_ACCOUNT_LINK_HMAC_SECRET ?? PLAYFAB_SECRET_KEY).trim();
 const ARCADE_PROGRESS_KEY = "ArcadeProgressJson";
 const ARCADE_PURCHASE_REWARD_KEY = "ArcadePurchaseRewardsJson";
+const FISHING_REWARD_STATE_KEY = "FishingRewardStateJson";
+const FISHING_REWARDS_ENABLED = isTruthy(process.env.FISHING_REWARDS_ENABLED);
+const FISHING_CONFIG = Object.freeze({
+  intervalMs: Math.max(5_000, Number.parseInt(process.env.FISHING_ROLL_INTERVAL_SECONDS ?? "90", 10) * 1000 || 90_000),
+  crownChanceBasisPoints: Math.min(10_000, Math.max(0, Number.parseInt(process.env.FISHING_CROWN_CHANCE_BPS ?? "400", 10) || 400)),
+  pityRolls: Math.max(1, Number.parseInt(process.env.FISHING_PITY_ROLLS ?? "40", 10) || 40),
+  dailyCap: Math.max(0, Number.parseInt(process.env.FISHING_DAILY_CROWN_CAP ?? "8", 10) || 8)
+});
 const SHOP_ITEMS = new Map([
   ["america-first-hat", { displayName: "America First Hat", kind: "cosmetic", slot: "hat", price: 5 }],
   ["shtreimel", { displayName: "Shtreimel", kind: "cosmetic", slot: "hat", price: 8 }],
   ["crusader-helmet", { displayName: "Crusader Helmet", kind: "cosmetic", slot: "hat", price: 12 }],
   ["king-crown", { displayName: "King Crown", kind: "cosmetic", slot: "hat", price: 20 }],
-  ["charlie-chaplin-mustache", { displayName: "Charlie Chaplin Mustache", kind: "cosmetic", slot: "miscellaneous", price: 16 }]
+  ["charlie-chaplin-mustache", { displayName: "Charlie Chaplin Mustache", kind: "cosmetic", slot: "miscellaneous", price: 16 }],
+  ["lobby-fishing-rod", { displayName: "Fishing Rod", kind: "lobby-item", price: 10 }]
 ]);
 let shopCatalogLastRefresh = 0;
 const ARCADE_RUN_TTL_MS = Math.max(60_000, Number.parseInt(process.env.ARCADE_RUN_TTL_SECONDS ?? "1800", 10) * 1000 || 1_800_000);
@@ -496,17 +507,20 @@ async function getShopInventory(playFabId) {
   const inventory = Array.isArray(data?.Inventory) ? data.Inventory : [];
   const owned = [];
   const ownedEmotes = [];
+  const ownedLobbyItems = [];
   for (const entry of inventory) {
     const itemId = String(entry?.ItemId ?? "").trim();
     const definition = SHOP_ITEMS.get(itemId);
     if (!definition) continue;
     if (definition.kind === "emote") ownedEmotes.push(itemId);
+    else if (definition.kind === "lobby-item") ownedLobbyItems.push(itemId);
     else owned.push(itemId);
   }
   return {
     crowns: parseNonNegativeInteger(data?.VirtualCurrency?.[SHOP_CURRENCY_CODE], 0),
     owned: [...new Set(owned)],
-    ownedEmotes: [...new Set(ownedEmotes)]
+    ownedEmotes: [...new Set(ownedEmotes)],
+    ownedLobbyItems: [...new Set(ownedLobbyItems)]
   };
 }
 
@@ -544,7 +558,7 @@ async function refreshAndVerifyPublishedCatalog(expectedCatalog, replace) {
 async function getShopLoadout(playFabId) {
   const data = await playFabServerRequest("/Server/GetUserReadOnlyData", {
     PlayFabId: playFabId,
-    Keys: ["CosmeticHat", "CosmeticShirt", "CosmeticPants", "CosmeticShoes", "CosmeticHair", "CosmeticHairColor", "CosmeticMiscellaneous", "CosmeticRevision", "EmoteWheel", "VictoryEmote", "EmoteRevision"]
+    Keys: ["CosmeticHat", "CosmeticShirt", "CosmeticPants", "CosmeticShoes", "CosmeticHair", "CosmeticHairColor", "CosmeticMiscellaneous", "CosmeticRevision", "EmoteWheel", "VictoryEmote", "EmoteRevision", "LobbyGearSlotsJson", "LobbyGearRevision"]
   });
   const values = data?.Data ?? {};
   const value = key => String(values?.[key]?.Value ?? "").trim();
@@ -553,6 +567,8 @@ async function getShopLoadout(playFabId) {
   if (!Array.isArray(miscellaneous)) miscellaneous = [];
   let emoteWheel = [];
   try { emoteWheel = JSON.parse(value("EmoteWheel") || "[]"); } catch { emoteWheel = []; }
+  let lobbyGear = [];
+  try { lobbyGear = JSON.parse(value("LobbyGearSlotsJson") || "[]"); } catch { lobbyGear = []; }
   return {
     hat: value("CosmeticHat"),
     shirt: value("CosmeticShirt"),
@@ -564,26 +580,35 @@ async function getShopLoadout(playFabId) {
     revision: parseNonNegativeInteger(value("CosmeticRevision"), 0),
     emoteWheel: normalizeEmoteWheel(emoteWheel),
     victoryEmote: value("VictoryEmote"),
-    emoteRevision: parseNonNegativeInteger(value("EmoteRevision"), 0)
+    emoteRevision: parseNonNegativeInteger(value("EmoteRevision"), 0),
+    lobbyGear: normalizeLobbyGear(lobbyGear),
+    gearRevision: parseNonNegativeInteger(value("LobbyGearRevision"), 0)
   };
 }
 
 async function saveShopLoadout(playFabId, loadout, scope = null) {
   const savesCosmetics = !scope || Boolean(scope.cosmeticSlot);
   const savesEmotes = !scope || Boolean(scope.emoteField);
+  const savesGear = !scope || Boolean(scope.gear);
   const revision = savesCosmetics
     ? Math.max(Date.now(), parseNonNegativeInteger(loadout?.revision, 0) + 1)
     : parseNonNegativeInteger(loadout?.revision, 0);
   const emoteRevision = savesEmotes
     ? Math.max(Date.now(), parseNonNegativeInteger(loadout?.emoteRevision, 0) + 1)
     : parseNonNegativeInteger(loadout?.emoteRevision, 0);
-  const update = scope?.cosmeticSlot
-    ? buildCosmeticLoadoutUpdate(loadout, scope.cosmeticSlot, revision)
-    : scope?.emoteField
-      ? buildEmoteLoadoutUpdate(loadout, scope.emoteField, emoteRevision)
-      : buildFullLoadoutUpdate(loadout, revision, emoteRevision);
+  const gearRevision = savesGear
+    ? Math.max(Date.now(), parseNonNegativeInteger(loadout?.gearRevision, 0) + 1)
+    : parseNonNegativeInteger(loadout?.gearRevision, 0);
+  let update;
+  if (scope?.cosmeticSlot) update = buildCosmeticLoadoutUpdate(loadout, scope.cosmeticSlot, revision);
+  else if (scope?.emoteField) update = buildEmoteLoadoutUpdate(loadout, scope.emoteField, emoteRevision);
+  else if (scope?.gear) update = buildLobbyGearUpdate(loadout, gearRevision);
+  else {
+    update = buildFullLoadoutUpdate(loadout, revision, emoteRevision);
+    Object.assign(update.Data, buildLobbyGearUpdate(loadout, gearRevision).Data);
+  }
   await playFabServerRequest("/Server/UpdateUserReadOnlyData", { PlayFabId: playFabId, ...update });
-  return { ...loadout, revision, emoteRevision, emoteWheel: normalizeEmoteWheel(loadout?.emoteWheel) };
+  return { ...loadout, revision, emoteRevision, gearRevision, emoteWheel: normalizeEmoteWheel(loadout?.emoteWheel), lobbyGear: normalizeLobbyGear(loadout?.lobbyGear) };
 }
 
 function playFabFailureDetails(error) {
@@ -613,9 +638,45 @@ function shopResponse(playFabId, inventory, loadout, message) {
     ownedEmotes: Array.isArray(inventory.ownedEmotes) ? inventory.ownedEmotes : [],
     emoteWheel: normalizeEmoteWheel(loadout.emoteWheel, inventory.ownedEmotes),
     victoryEmote: inventory.ownedEmotes?.includes(loadout.victoryEmote) ? loadout.victoryEmote : "",
-    emoteRev: loadout.emoteRevision || 0
+    emoteRev: loadout.emoteRevision || 0,
+    ownedLobbyItems: Array.isArray(inventory.ownedLobbyItems) ? inventory.ownedLobbyItems : [],
+    lobbyGear: normalizeLobbyGear(loadout.lobbyGear, inventory.ownedLobbyItems),
+    gearRev: loadout.gearRevision || 0
   }).token;
-  return { ok: true, message, crowns: inventory.crowns, owned: inventory.owned, ownedEmotes: Array.isArray(inventory.ownedEmotes) ? inventory.ownedEmotes : [], hat: loadout.hat || "", shirt: loadout.shirt || "", pants: loadout.pants || "", shoes: loadout.shoes || "", hair: loadout.hair || "", hairColor: loadout.hairColor || "", miscellaneous: Array.isArray(loadout.miscellaneous) ? loadout.miscellaneous : [], revision: loadout.revision || 0, emoteWheel: normalizeEmoteWheel(loadout.emoteWheel, inventory.ownedEmotes), victoryEmote: inventory.ownedEmotes?.includes(loadout.victoryEmote) ? loadout.victoryEmote : "", emoteRevision: loadout.emoteRevision || 0, receipt };
+  return {
+    ok: true, message, crowns: inventory.crowns,
+    owned: inventory.owned,
+    ownedEmotes: Array.isArray(inventory.ownedEmotes) ? inventory.ownedEmotes : [],
+    ownedLobbyItems: Array.isArray(inventory.ownedLobbyItems) ? inventory.ownedLobbyItems : [],
+    hat: loadout.hat || "", shirt: loadout.shirt || "", pants: loadout.pants || "",
+    shoes: loadout.shoes || "", hair: loadout.hair || "", hairColor: loadout.hairColor || "",
+    miscellaneous: Array.isArray(loadout.miscellaneous) ? loadout.miscellaneous : [],
+    revision: loadout.revision || 0,
+    emoteWheel: normalizeEmoteWheel(loadout.emoteWheel, inventory.ownedEmotes),
+    victoryEmote: inventory.ownedEmotes?.includes(loadout.victoryEmote) ? loadout.victoryEmote : "",
+    emoteRevision: loadout.emoteRevision || 0,
+    lobbyGear: normalizeLobbyGear(loadout.lobbyGear, inventory.ownedLobbyItems),
+    gearRevision: loadout.gearRevision || 0,
+    receipt
+  };
+}
+
+async function getFishingState(playFabId) {
+  const data = await getReadOnlyData(playFabId, [FISHING_REWARD_STATE_KEY]);
+  try { return normalizeFishingState(JSON.parse(data[FISHING_REWARD_STATE_KEY] || "{}")); }
+  catch { return normalizeFishingState({}); }
+}
+
+async function saveFishingState(playFabId, state) {
+  const normalized = normalizeFishingState(state);
+  await updateReadOnlyData(playFabId, { [FISHING_REWARD_STATE_KEY]: JSON.stringify(normalized) });
+  return normalized;
+}
+
+function isLiveOfficialRoom(roomId) {
+  pruneRooms();
+  const room = getRoom(String(roomId ?? "").trim());
+  return Boolean(room && Date.now() - room.lastSeen <= HEARTBEAT_TIMEOUT_MS);
 }
 
 async function getArcadeProgress(playFabId) {
@@ -1317,6 +1378,127 @@ app.post("/shop/emote/equip", async (req, res) => {
     const status = error.status === 401 ? 401 : 500;
     console.warn(`[shop] Emote equip failed stage=UpdateUserReadOnlyData details=${playFabFailureDetails(error)}`);
     return res.status(status).json({ ok: false, error: status === 401 ? "Invalid PlayFab session ticket" : "Could not update emotes." });
+  }
+});
+
+app.post("/shop/gear/equip", async (req, res) => {
+  if (!requirePlayFabConfigured(res)) return;
+  try {
+    const playFabId = await authenticateShopRequest(req, res);
+    if (!playFabId) return;
+    const itemId = String(req.body?.itemId ?? "").trim();
+    const inventory = await getShopInventory(playFabId);
+    const loadout = await getShopLoadout(playFabId);
+    const update = updateLobbyGearSlot(loadout.lobbyGear, req.body?.gearSlot, itemId, inventory.ownedLobbyItems);
+    if (!update.ok)
+      return res.status(update.error === "not-owned" ? 403 : 400).json({ ok: false, error: update.error === "not-owned" ? "Purchase this lobby item before assigning it." : "Choose a valid gear slot." });
+    loadout.lobbyGear = update.slots;
+    const saved = await saveShopLoadout(playFabId, loadout, { gear: true });
+    return res.json(shopResponse(playFabId, inventory, saved, itemId ? "Lobby gear assigned." : "Gear slot cleared."));
+  } catch (error) {
+    const status = error.status === 401 ? 401 : 500;
+    console.warn(`[shop] Gear equip failed: ${error.message}`);
+    return res.status(status).json({ ok: false, error: status === 401 ? "Invalid PlayFab session ticket" : "Could not update lobby gear." });
+  }
+});
+
+app.post("/fishing/start", async (req, res) => {
+  if (!requirePlayFabConfigured(res)) return;
+  try {
+    const playFabId = await authenticateShopRequest(req, res);
+    if (!playFabId) return;
+    const roomId = String(req.body?.roomId ?? "").trim();
+    if (!isLiveOfficialRoom(roomId))
+      return res.status(403).json({ ok: false, error: "Fishing rewards require a live official online lobby." });
+    const [inventory, loadout] = await Promise.all([getShopInventory(playFabId), getShopLoadout(playFabId)]);
+    if (!inventory.ownedLobbyItems.includes("lobby-fishing-rod") || !loadout.lobbyGear.includes("lobby-fishing-rod"))
+      return res.status(403).json({ ok: false, error: "Own and assign the fishing rod before casting." });
+    const state = await getFishingState(playFabId);
+    const saved = await saveFishingState(playFabId, startFishing(state, roomId, Date.now(), FISHING_CONFIG));
+    return res.json({
+      ...shopResponse(playFabId, inventory, loadout, "Fishing started."),
+      hasFishingState: true,
+      fishingActive: true,
+      fishingRewardsEnabled: FISHING_REWARDS_ENABLED,
+      fishingAwardedToday: saved.awardedToday,
+      fishingDailyCap: FISHING_CONFIG.dailyCap,
+      nextFishingRollAt: saved.nextEligibleAt
+    });
+  } catch (error) {
+    const status = error.status === 401 ? 401 : 500;
+    console.warn(`[fishing] Start failed: ${error.message}`);
+    return res.status(status).json({ ok: false, error: status === 401 ? "Invalid PlayFab session ticket" : "Fishing could not start." });
+  }
+});
+
+app.post("/fishing/roll", async (req, res) => {
+  if (!requirePlayFabConfigured(res)) return;
+  try {
+    const playFabId = await authenticateShopRequest(req, res);
+    if (!playFabId) return;
+    const roomId = String(req.body?.roomId ?? "").trim();
+    const requestId = String(req.body?.requestId ?? "").trim();
+    if (!isLiveOfficialRoom(roomId))
+      return res.status(403).json({ ok: false, error: "The official lobby lease expired; fishing rewards paused." });
+
+    const payload = await runFishingExclusive(playFabId, async () => {
+      const [inventory, loadout, state] = await Promise.all([getShopInventory(playFabId), getShopLoadout(playFabId), getFishingState(playFabId)]);
+      if (!inventory.ownedLobbyItems.includes("lobby-fishing-rod") || !loadout.lobbyGear.includes("lobby-fishing-rod"))
+        return { status: 403, body: { ok: false, error: "The fishing rod is no longer assigned." } };
+      const effectiveConfig = FISHING_REWARDS_ENABLED
+        ? FISHING_CONFIG
+        : { ...FISHING_CONFIG, crownChanceBasisPoints: 0, pityRolls: 1_000_000 };
+      const decision = resolveFishingRoll(state, {
+        nowMs: Date.now(), requestId, roomId,
+        randomBasisPoints: crypto.randomInt(0, 10_000),
+        config: effectiveConfig
+      });
+      if (!decision.ok) {
+        const status = decision.error === "too-early" ? 409 : 400;
+        return { status, body: { ok: false, code: decision.error, error: decision.error === "too-early" ? "The next catch is not ready yet." : "Fishing is not active.", retryAfterSeconds: Math.ceil((decision.retryAfterMs ?? 0) / 1000) } };
+      }
+      if (!decision.duplicate) {
+        await saveFishingState(playFabId, decision.state);
+        if (decision.result.crownAwarded > 0)
+          await addShopCrowns(playFabId, decision.result.crownAwarded);
+      }
+      const refreshedInventory = decision.result.crownAwarded > 0 ? await getShopInventory(playFabId) : inventory;
+      return {
+        status: 200,
+        body: {
+          ...shopResponse(playFabId, refreshedInventory, loadout, decision.result.crownAwarded > 0 ? "The catch included +1 Crown!" : "You caught something."),
+          hasFishingState: true,
+          fishingActive: true,
+          fishingRewardsEnabled: FISHING_REWARDS_ENABLED,
+          fishingCrownAwarded: decision.result.crownAwarded,
+          fishingAwardedToday: decision.result.awardedToday,
+          fishingDailyCap: FISHING_CONFIG.dailyCap,
+          fishingCapped: FISHING_REWARDS_ENABLED && decision.result.capped,
+          fishingPity: decision.result.pity,
+          nextFishingRollAt: decision.result.nextEligibleAt,
+          duplicate: decision.duplicate
+        }
+      };
+    });
+    return res.status(payload.status).json(payload.body);
+  } catch (error) {
+    const status = error.status === 401 ? 401 : 500;
+    console.warn(`[fishing] Roll failed: ${error.message}`);
+    return res.status(status).json({ ok: false, error: status === 401 ? "Invalid PlayFab session ticket" : "The catch could not be verified." });
+  }
+});
+
+app.post("/fishing/stop", async (req, res) => {
+  if (!requirePlayFabConfigured(res)) return;
+  try {
+    const playFabId = await authenticateShopRequest(req, res);
+    if (!playFabId) return;
+    await runFishingExclusive(playFabId, async () => saveFishingState(playFabId, stopFishing(await getFishingState(playFabId))));
+    const [inventory, loadout] = await Promise.all([getShopInventory(playFabId), getShopLoadout(playFabId)]);
+    return res.json({ ...shopResponse(playFabId, inventory, loadout, "Fishing paused."), hasFishingState: true, fishingActive: false, fishingRewardsEnabled: FISHING_REWARDS_ENABLED, fishingDailyCap: FISHING_CONFIG.dailyCap });
+  } catch (error) {
+    const status = error.status === 401 ? 401 : 500;
+    return res.status(status).json({ ok: false, error: status === 401 ? "Invalid PlayFab session ticket" : "Fishing could not be paused." });
   }
 });
 

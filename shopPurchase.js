@@ -78,7 +78,11 @@ export async function executeShopPurchase({
     throw new ShopPurchaseError(404, "item-unavailable", "That shop item is not available.");
 
   const before = await getInventory(playFabId);
-  const ownedList = definition.kind === "emote" ? before.ownedEmotes : before.owned;
+  const ownedList = definition.kind === "emote"
+    ? before.ownedEmotes
+    : definition.kind === "lobby-item"
+      ? before.ownedLobbyItems
+      : before.owned;
   const decision = purchaseDecision(before.crowns, definition.price, ownedList.includes(itemId));
   if (decision.alreadyOwned) {
     const loadout = await getLoadout(playFabId);
@@ -86,7 +90,7 @@ export async function executeShopPurchase({
       playFabId,
       before,
       loadout,
-      `You already own this ${definition.kind === "emote" ? "emote" : "cosmetic"}.`);
+      `You already own this ${definition.kind === "emote" ? "emote" : definition.kind === "lobby-item" ? "lobby item" : "cosmetic"}.`);
   }
   if (!decision.ok)
     throw new ShopPurchaseError(409, "insufficient-crowns", "Not enough crowns.");

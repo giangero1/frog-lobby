@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { arcadePurchaseRewardDecision, buildCosmeticLoadoutUpdate, buildEmoteLoadoutUpdate, buildFullLoadoutUpdate, catalogPublishMismatches, mergeArcadeProgress, normalizeArcadeProgress, normalizeArcadeRewardState, normalizeCatalogItem, normalizeCatalogItems, normalizeEmoteWheel, normalizeHexColor, normalizePublishedCatalog, purchaseDecision, updateEmoteWheelSlot, updateMiscellaneousSelection, validateEquipSelection, validateVictoryEmote } from "./shopLogic.js";
+import { arcadePurchaseRewardDecision, buildCosmeticLoadoutUpdate, buildEmoteLoadoutUpdate, buildFullLoadoutUpdate, buildLobbyGearUpdate, catalogPublishMismatches, mergeArcadeProgress, normalizeArcadeProgress, normalizeArcadeRewardState, normalizeCatalogItem, normalizeCatalogItems, normalizeEmoteWheel, normalizeHexColor, normalizeLobbyGear, normalizePublishedCatalog, purchaseDecision, updateEmoteWheelSlot, updateLobbyGearSlot, updateMiscellaneousSelection, validateEquipSelection, validateVictoryEmote } from "./shopLogic.js";
 
 test("purchase rejects insufficient balance and accepts owned idempotently", () => {
   assert.equal(purchaseDecision(4, 5, false).error, "insufficient-crowns");
@@ -50,6 +50,22 @@ test("catalog accepts emote entries with emote custom data", () => {
   const item = normalizeCatalogItem({ itemId: "wave", displayName: "Wave", kind: "emote", price: 0 }, "CR");
   assert.equal(item.CustomData, '{"kind":"emote"}');
   assert.equal(item.VirtualCurrencyPrices.CR, 0);
+});
+
+test("catalog accepts lobby items without cosmetic slots", () => {
+  const item = normalizeCatalogItem({ itemId: "lobby-fishing-rod", displayName: "Fishing Rod", kind: "lobby-item", price: 10 }, "CR");
+  assert.equal(item.CustomData, '{"kind":"lobby-item"}');
+  assert.equal(item.VirtualCurrencyPrices.CR, 10);
+});
+
+test("three-slot lobby gear requires ownership and removes duplicates", () => {
+  assert.deepEqual(normalizeLobbyGear(["rod", "rod", "ball"], ["rod", "ball"]), ["rod", "", "ball"]);
+  assert.equal(updateLobbyGearSlot([], 3, "rod", ["rod"]).error, "invalid-gear-slot");
+  assert.equal(updateLobbyGearSlot([], 0, "rod", []).error, "not-owned");
+  assert.deepEqual(updateLobbyGearSlot(["rod", "", "ball"], 1, "rod", ["rod", "ball"]).slots, ["", "rod", "ball"]);
+  assert.deepEqual(buildLobbyGearUpdate({ lobbyGear: ["rod"] }, 42), {
+    Data: { LobbyGearSlotsJson: '["rod","",""]', LobbyGearRevision: "42" }
+  });
 });
 
 test("miscellaneous cosmetics equip independently and can all be cleared", () => {

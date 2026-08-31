@@ -1,5 +1,5 @@
 export const SHOP_SLOTS = new Set(["hat", "shirt", "pants", "shoes", "hair", "miscellaneous"]);
-export const SHOP_KINDS = new Set(["cosmetic", "emote"]);
+export const SHOP_KINDS = new Set(["cosmetic", "emote", "lobby-item"]);
 export const ARCADE_PURCHASE_REWARD_CROWNS = 2;
 export const ARCADE_REWARD_SKIN_IDS = new Set(["americafirsthat", "shtreimel", "crusader-helmet", "crown"]);
 export const ARCADE_REWARD_UPGRADE_MAX_LEVELS = new Map([
@@ -126,6 +126,41 @@ export function validateVictoryEmote(itemId, owned) {
   return { ok: true, itemId: normalizedId };
 }
 
+export function normalizeLobbyGear(current, owned = null, limit = 3) {
+  const ownedSet = Array.isArray(owned) ? new Set(owned.map(x => String(x).trim()).filter(Boolean)) : null;
+  const source = Array.isArray(current) ? current : [];
+  const slots = [];
+  const used = new Set();
+  for (let i = 0; i < limit; i++) {
+    const itemId = String(source[i] ?? "").trim();
+    const valid = itemId && !used.has(itemId) && (!ownedSet || ownedSet.has(itemId));
+    slots.push(valid ? itemId : "");
+    if (valid) used.add(itemId);
+  }
+  return slots;
+}
+
+export function updateLobbyGearSlot(current, slot, itemId, owned, limit = 3) {
+  const index = Number.isInteger(slot) ? slot : Number.parseInt(slot, 10);
+  if (!Number.isInteger(index) || index < 0 || index >= limit) return { ok: false, error: "invalid-gear-slot" };
+  const normalizedId = String(itemId ?? "").trim();
+  if (normalizedId && (!Array.isArray(owned) || !owned.includes(normalizedId))) return { ok: false, error: "not-owned" };
+  const slots = normalizeLobbyGear(current, owned, limit);
+  for (let i = 0; i < slots.length; i++)
+    if (i !== index && slots[i] === normalizedId) slots[i] = "";
+  slots[index] = normalizedId;
+  return { ok: true, slots };
+}
+
+export function buildLobbyGearUpdate(loadout, revision) {
+  return {
+    Data: {
+      LobbyGearSlotsJson: JSON.stringify(normalizeLobbyGear(loadout?.lobbyGear)),
+      LobbyGearRevision: String(revision)
+    }
+  };
+}
+
 /**
  * Normalizes a hair-color hex string to canonical 8-digit "RRGGBBAA" upper-case, or "" when
  * empty/invalid. Accepts optional leading '#', and 6- or 8-digit hex (6 implies opaque alpha).
@@ -153,7 +188,7 @@ export function normalizeCatalogItem(raw, currencyCode) {
     ItemId: itemId,
     DisplayName: String(raw?.displayName ?? itemId).slice(0, 80),
     VirtualCurrencyPrices: { [currencyCode]: price },
-    CustomData: JSON.stringify(kind === "emote" ? { kind: "emote" } : { kind: "cosmetic", slot })
+    CustomData: JSON.stringify(kind === "cosmetic" ? { kind: "cosmetic", slot } : { kind })
   };
 }
 
@@ -212,7 +247,7 @@ export function catalogPublishMismatches(expectedCatalog, actualDefinitions, req
     const actual = actualById.get(itemId);
     let custom = {};
     try { custom = JSON.parse(expected.CustomData ?? "{}"); } catch { custom = {}; }
-    const expectedKind = custom.kind === "emote" ? "emote" : "cosmetic";
+    const expectedKind = SHOP_KINDS.has(custom.kind) ? custom.kind : "cosmetic";
     const expectedSlot = expectedKind === "cosmetic" ? String(custom.slot ?? "") : undefined;
     const expectedPrice = expected.VirtualCurrencyPrices?.[currencyCode];
     if (!actual) {
